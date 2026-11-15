@@ -1,0 +1,19 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "done-notify",
+  "displayName": "Done Notify",
+  "version": "1.0.0",
+  "description": "macOS Notification Center banner with sound when an Antigravity CLI turn finishes, fails, completes a background task, or waits on a question while the CLI is not focused.",
+  "author": {
+    "name": "Ruizhi Yu",
+    "url": "https://github.com/rzyu45"
+  },
+  "repository": "https://github.com/rzyu45/agy-plugins",
+  "category": "Productivity",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Test Done Notify macOS banner and sound",
+    "Check Done Notify terminal focus detection status",
+    "Configure Done Notify sound and focus mode for agy CLI"
+  ]
+}

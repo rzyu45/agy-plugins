@@ -1,0 +1,19 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "token-weather",
+  "displayName": "Token Weather",
+  "version": "1.2.0",
+  "description": "Live weather-themed context window forecast, execution mode badge (auto, plan, accept-edits, default), 5-hour and weekly quota usage & pacing, recent-turn sparkline, token delta, and prompt cache TTL status line for Antigravity CLI.",
+  "author": {
+    "name": "Ruizhi Yu",
+    "url": "https://github.com/rzyu45"
+  },
+  "repository": "https://github.com/rzyu45/agy-plugins",
+  "category": "Productivity",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Preview Token Weather status line styles",
+    "Configure Token Weather options for agy CLI",
+    "Switch Token Weather to two-line quota layout"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "done-notify": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./skills/done-notify/scripts/done-notify.py",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^ask_question$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./skills/done-notify/scripts/done-notify.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
