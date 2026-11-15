@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """macOS Notification Center + sound notifier for Antigravity CLI (agy).
 
-Modeled on Claude Code's local `done-notify` plugin, extended with terminal and
-tab focus detection so notifications only fire when the user is not currently
-focused on the active `agy` CLI session.
+Modeled on Claude Code's local `done-notify` plugin, extended with:
+- Terminal and tab focus detection for completed/failed turns (`Stop`).
+- Immediate sound + banner alerts when `agy` pauses for user input
+  (`ask_question`) or waits for user permission approval (`Surfacing tool
+  confirmation` / queued subagent approval).
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,7 +25,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 OSASCRIPT_LINES = (
     "on run argv",
-    "if (count of argv) >= 4 and (item 4 of argv) is not \"\" then",
+    'if (count of argv) >= 4 and (item 4 of argv) is not "" then',
     "display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv) sound name (item 4 of argv)",
     "else",
     "display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)",
@@ -110,6 +113,34 @@ MID_TURN_STEP_TYPES = {
     "TASK_BOUNDARY",
 }
 
+PERMISSION_LABELS_ZH: Dict[str, str] = {
+    "Command": "终端命令执行需要你确认权限。",
+    "Create file": "创建文件需要你确认权限。",
+    "Pending edit": "修改文件需要你确认权限。",
+    "File access": "访问文件需要你确认权限。",
+    "MCP": "MCP工具调用需要你确认权限。",
+    "Read URL": "读取网页需要你确认权限。",
+    "Browser action": "浏览器操作需要你确认权限。",
+    "Browser download": "浏览器下载需要你确认权限。",
+    "UAC Escalation": "提权操作需要你确认权限。",
+    "Tool": "工具调用需要你确认权限。",
+    "": "工具调用需要你确认权限。",
+}
+
+PERMISSION_LABELS_EN: Dict[str, str] = {
+    "Command": "A command is waiting for your permission.",
+    "Create file": "File creation is waiting for your permission.",
+    "Pending edit": "File edit is waiting for your permission.",
+    "File access": "File access is waiting for your permission.",
+    "MCP": "An MCP tool call is waiting for your permission.",
+    "Read URL": "URL access is waiting for your permission.",
+    "Browser action": "A browser action is waiting for your permission.",
+    "Browser download": "A browser download is waiting for your permission.",
+    "UAC Escalation": "Privilege escalation is waiting for your permission.",
+    "Tool": "A tool call is waiting for your permission.",
+    "": "A tool call is waiting for your permission.",
+}
+
 APP_BUNDLE_RE = re.compile(r"(/[^:\n]*?\.app)(?=/Contents/)")
 FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
 INLINE_CODE_RE = re.compile(r"`([^`]*)`")
@@ -119,18 +150,39 @@ MD_EMPHASIS_RE = re.compile(r"\*\*|~~|__")
 HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
 WHITESPACE_RE = re.compile(r"\s+")
 
+GLOG_LINE_RE = re.compile(
+    r"^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+[^\]]+\]\s+(?P<msg>.*)$"
+)
+TOOL_CONFIRM_RE = re.compile(
+    r'^Surfacing tool confirmation:\s+"(?P<label>(?:\\.|[^"\\])*)"\s+at step\s+(?P<step>\d+)\b'
+)
+SUBAGENT_QUEUE_RE = re.compile(
+    r"^updatePendingApprovalsQueue: added to queue and marked seen:\s+(?P<subagent>\S+)\s+step\s+(?P<step>\d+)\b"
+)
+ASK_QUESTION_LOG_RE = re.compile(
+    r"^Surfacing ask_question at step\s+(?P<step>\d+)\b"
+)
+
+WATCHER_POLL_SEC = 0.20
+WATCHER_LSTART_CHECK_SEC = 30.0
+WATCHER_MAX_LIFETIME_SEC = 86400.0
+PRETOOL_QUESTION_DEDUP_SEC = 8.0
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": True,
-    "focus_mode": "tab",          # "tab" | "app" | "always"
-    "sound": "Glass",             # macOS sound in /System/Library/Sounds
-    "error_sound": "Sosumi",      # macOS sound on failed turns
-    "sound_mode": "notification", # "notification" | "afplay" | "both" | "off"
-    "lang": "en",                 # "en" | "zh"
+    "focus_mode": "tab",            # "tab" | "app" | "always" (for Stop completion/failure)
+    "prompt_focus_mode": "always",  # "always" | "tab" | "app" (for question & permission prompts)
+    "sound": "Glass",               # macOS sound on completed turns
+    "prompt_sound": "Ping",         # macOS sound on question & permission prompts
+    "error_sound": "Sosumi",        # macOS sound on failed turns
+    "sound_mode": "notification",   # "notification" | "afplay" | "both" | "off"
+    "lang": "en",                   # "en" | "zh"
     "title": "Antigravity CLI",
     "body_max": 180,
     "min_duration_sec": 0.0,
     "cli_only": True,
     "notify_on_question": True,
+    "notify_on_permission": True,
     "notify_when_bg_running": True,
 }
 
@@ -140,6 +192,51 @@ def _config_path() -> str:
         "DONE_NOTIFY_CONFIG",
         os.path.expanduser("~/.config/agy-done-notify/config.json"),
     )
+
+
+def _runtime_dir() -> str:
+    override = os.environ.get("DONE_NOTIFY_RUNTIME_DIR", "").strip()
+    if override:
+        return override
+    return f"/tmp/agy-done-notify-{os.getuid()}"
+
+
+def _watcher_state_path(agy_pid: int) -> str:
+    return os.path.join(_runtime_dir(), f"watcher-{agy_pid}.json")
+
+
+def _watcher_context_path(agy_pid: int) -> str:
+    return os.path.join(_runtime_dir(), f"context-{agy_pid}.json")
+
+
+def _question_marker_path(agy_pid: int) -> str:
+    return os.path.join(_runtime_dir(), f"question-{agy_pid}.json")
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _read_json_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        return obj if isinstance(obj, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 def _parse_bool(val: Any, default: bool = False) -> bool:
@@ -184,11 +281,12 @@ def _normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     if "enabled" in raw:
         cfg["enabled"] = _parse_bool(raw["enabled"], True)
 
-    focus_mode = str(raw.get("focus_mode", cfg["focus_mode"])).strip().lower()
-    if focus_mode in ("tab", "app", "always"):
-        cfg["focus_mode"] = focus_mode
+    for mode_key in ("focus_mode", "prompt_focus_mode"):
+        mode_val = str(raw.get(mode_key, cfg[mode_key])).strip().lower()
+        if mode_val in ("tab", "app", "always"):
+            cfg[mode_key] = mode_val
 
-    for key in ("sound", "error_sound", "title"):
+    for key in ("sound", "prompt_sound", "error_sound", "title"):
         if key in raw and raw[key] is not None:
             cfg[key] = str(raw[key]).strip()
 
@@ -206,7 +304,12 @@ def _normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     if "min_duration_sec" in raw:
         cfg["min_duration_sec"] = _parse_float(raw["min_duration_sec"], 0.0, minimum=0.0)
 
-    for key in ("cli_only", "notify_on_question", "notify_when_bg_running"):
+    for key in (
+        "cli_only",
+        "notify_on_question",
+        "notify_on_permission",
+        "notify_when_bg_running",
+    ):
         if key in raw:
             cfg[key] = _parse_bool(raw[key], DEFAULT_CONFIG[key])
 
@@ -259,6 +362,33 @@ def _safe_realpath(path: str) -> str:
         return os.path.realpath(path)
     except OSError:
         return path
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _process_lstart(pid: int) -> str:
+    if pid <= 1:
+        return ""
+    try:
+        out = subprocess.check_output(
+            ["/bin/ps", "-p", str(pid), "-o", "lstart="],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.0,
+        ).strip()
+        return out
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def plain_text(markdown: str) -> str:
@@ -548,8 +678,8 @@ def _check_apple_terminal_tab_focused(our_tty: str) -> Optional[Tuple[bool, str]
     script = (
         'tell application "Terminal"\n'
         'if (count of windows) is 0 then return ""\n'
-        'return tty of selected tab of front window\n'
-        'end tell'
+        "return tty of selected tab of front window\n"
+        "end tell"
     )
     try:
         out = subprocess.check_output(
@@ -578,10 +708,10 @@ def _check_iterm2_tab_focused(our_tty: str, iterm_session_id: str) -> Optional[T
     script = (
         'tell application "iTerm2"\n'
         'if (count of windows) is 0 then return ""\n'
-        'tell current session of current window\n'
+        "tell current session of current window\n"
         'return (unique ID) & "\\t" & (tty)\n'
-        'end tell\n'
-        'end tell'
+        "end tell\n"
+        "end tell"
     )
     try:
         out = subprocess.check_output(
@@ -673,17 +803,28 @@ def _check_kitty_window_focused(kitty_win_id: str, listen_on: str) -> Optional[T
     return None
 
 
-def inspect_focus_state(focus_mode: str = "tab") -> Dict[str, Any]:
+def inspect_focus_state(
+    focus_mode: str = "tab", target_pid: Optional[int] = None
+) -> Dict[str, Any]:
     """Inspect CLI interactivity, terminal ownership, and current macOS focus."""
     ps_table = _read_ps_table()
-    ancestors = _walk_ancestors(os.getpid(), ps_table)
+    start_pid = target_pid if (target_pid is not None and target_pid > 1) else os.getpid()
+    ancestors = _walk_ancestors(start_pid, ps_table)
 
     is_interactive = True
     agy_pid = 0
+    mock_agy_pid = os.environ.get("DONE_NOTIFY_MOCK_AGY_PID", "").strip()
+    if mock_agy_pid:
+        try:
+            agy_pid = int(mock_agy_pid)
+        except ValueError:
+            agy_pid = 0
+
     for pid, _, args in ancestors:
         headless = _is_agy_command_headless(args)
         if headless is not None:
-            agy_pid = pid
+            if not agy_pid:
+                agy_pid = pid
             if headless:
                 is_interactive = False
             break
@@ -707,7 +848,7 @@ def inspect_focus_state(focus_mode: str = "tab") -> Dict[str, Any]:
     effective_ancestors = list(ancestors)
     has_reattached_tmux_client = False
 
-    if tmux_pane:
+    if tmux_pane and focus_mode != "always":
         tmux_info = _query_tmux_state(tmux_pane)
         if tmux_info.get("queried") and not tmux_info.get("pane_focused", True):
             return {
@@ -737,7 +878,6 @@ def inspect_focus_state(focus_mode: str = "tab") -> Dict[str, Any]:
 
     ancestor_pids = {pid for pid, _, _ in effective_ancestors}
     ancestor_bundles = _extract_bundle_paths(effective_ancestors)
-    front = _query_frontmost_app()
 
     host_summary = {
         "agy_pid": agy_pid,
@@ -754,9 +894,10 @@ def inspect_focus_state(focus_mode: str = "tab") -> Dict[str, Any]:
             "focused": False,
             "reason": "focus_mode=always (notify regardless of focus)",
             "host": host_summary,
-            "frontmost": front,
+            "frontmost": {},
         }
 
+    front = _query_frontmost_app()
     front_bid = front.get("bundle_id") or ""
     front_bpath = front.get("bundle_path") or ""
     front_pid = front.get("pid") or 0
@@ -844,6 +985,181 @@ def inspect_focus_state(focus_mode: str = "tab") -> Dict[str, Any]:
         "host": host_summary,
         "frontmost": front,
     }
+
+
+def _find_ancestor_agy_pid() -> Tuple[int, bool]:
+    """Return (agy_pid, is_interactive) for the owning `agy` CLI process."""
+    mock_pid_str = os.environ.get("DONE_NOTIFY_MOCK_AGY_PID", "").strip()
+    mock_pid = 0
+    if mock_pid_str:
+        try:
+            mock_pid = int(mock_pid_str)
+        except ValueError:
+            mock_pid = 0
+
+    ps_table = _read_ps_table()
+    ancestors = _walk_ancestors(os.getpid(), ps_table)
+    is_interactive = True
+    agy_pid = mock_pid
+
+    for pid, _, args in ancestors:
+        headless = _is_agy_command_headless(args)
+        if headless is not None:
+            if not agy_pid:
+                agy_pid = pid
+            if headless:
+                is_interactive = False
+            break
+
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        is_interactive = False
+    if _parse_bool(os.environ.get("DONE_NOTIFY_FORCE_INTERACTIVE"), False):
+        is_interactive = True
+
+    return agy_pid, is_interactive
+
+
+def _resolve_cli_log_path(agy_pid: int) -> str:
+    """Resolve the active `cli-*.log` file held open by `agy_pid`."""
+    override = os.environ.get("DONE_NOTIFY_CLI_LOG_FILE", "").strip()
+    if override:
+        return override
+
+    if agy_pid > 1:
+        try:
+            out = subprocess.check_output(
+                ["/usr/sbin/lsof", "-a", "-p", str(agy_pid), "-d", "1,2", "-Fn"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1.5,
+            )
+            for line in out.splitlines():
+                if line.startswith("n/"):
+                    candidate = line[1:].strip()
+                    if candidate.endswith(".log") and os.path.isfile(candidate):
+                        return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    log_dir = os.path.expanduser("~/.gemini/antigravity-cli/log")
+    symlink_path = os.path.join(log_dir, "cli.log")
+    if os.path.exists(symlink_path):
+        resolved = _safe_realpath(symlink_path)
+        if os.path.isfile(resolved):
+            return resolved
+
+    try:
+        entries = [
+            os.path.join(log_dir, name)
+            for name in os.listdir(log_dir)
+            if name.startswith("cli-") and name.endswith(".log")
+        ]
+        entries = [p for p in entries if os.path.isfile(p)]
+        if entries:
+            entries.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            return entries[0]
+    except OSError:
+        pass
+
+    return ""
+
+
+def _inspect_prompt_watcher_status(agy_pid: int) -> Dict[str, Any]:
+    if agy_pid <= 1:
+        return {"running": False, "agy_pid": agy_pid}
+    state = _read_json_file(_watcher_state_path(agy_pid))
+    if not state:
+        return {"running": False, "agy_pid": agy_pid}
+    wpid = int(state.get("watcher_pid") or 0)
+    alive = _pid_alive(wpid)
+    if alive:
+        rec_lstart = str(state.get("watcher_lstart") or "")
+        cur_lstart = _process_lstart(wpid)
+        if rec_lstart and cur_lstart and rec_lstart != cur_lstart:
+            alive = False
+    return {
+        "running": alive,
+        "agy_pid": agy_pid,
+        "watcher_pid": wpid if alive else 0,
+        "log_path": str(state.get("log_path") or ""),
+    }
+
+
+def _ensure_prompt_watcher(agy_pid: int, project: str) -> None:
+    if agy_pid <= 1 or not _pid_alive(agy_pid):
+        return
+
+    try:
+        _atomic_write_json(
+            _watcher_context_path(agy_pid),
+            {"project": project, "updated_at": time.time()},
+        )
+    except OSError:
+        pass
+
+    status = _inspect_prompt_watcher_status(agy_pid)
+    if status.get("running"):
+        return
+
+    cmd: List[str] = [
+        sys.executable or "/usr/bin/python3",
+        os.path.abspath(__file__),
+        "--watch-prompts",
+        "--agy-pid",
+        str(agy_pid),
+        "--project",
+        project,
+    ]
+    override_log = os.environ.get("DONE_NOTIFY_CLI_LOG_FILE", "").strip()
+    if override_log and os.path.isfile(override_log):
+        try:
+            cmd.extend(["--start-offset", str(os.path.getsize(override_log))])
+        except OSError:
+            pass
+
+    try:
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _record_question_marker(agy_pid: int) -> None:
+    if agy_pid <= 1:
+        return
+    try:
+        _atomic_write_json(_question_marker_path(agy_pid), {"ts": time.time()})
+    except OSError:
+        pass
+
+
+def _recent_question_marker(agy_pid: int) -> bool:
+    if agy_pid <= 1:
+        return False
+    marker = _read_json_file(_question_marker_path(agy_pid))
+    if not marker:
+        return False
+    try:
+        ts = float(marker.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 <= (time.time() - ts) < PRETOOL_QUESTION_DEDUP_SEC
+
+
+def _unescape_go_quoted(raw_inner: str) -> str:
+    try:
+        val = json.loads('"' + raw_inner + '"')
+        if isinstance(val, str):
+            return val
+    except ValueError:
+        pass
+    return raw_inner
 
 
 def _read_tail_jsonl_entries(path: str, max_bytes: int = 262144) -> List[Tuple[int, Dict[str, Any]]]:
@@ -958,8 +1274,6 @@ def _extract_turn_details(payload: Dict[str, Any]) -> Tuple[Optional[float], boo
                 earliest_model_ts = step_ts
             continue
 
-        # Check if a SYSTEM_MESSAGE / non-MODEL step started a reactive wakeup
-        # right after a completed prior turn (a PLANNER_RESPONSE without tool_calls).
         prev_step = entries[pos - 1][1] if pos > 0 else None
         prev_ended_turn = (
             prev_step is None
@@ -1021,38 +1335,38 @@ def _build_stop_notification(
     if is_failure:
         if reason == "MAX_TOKEN_BUDGET_EXCEEDED":
             status = (
-                f"超出Token预算 ({took})" if (zh and took)
+                f"超出Token预算（{took}）" if (zh and took)
                 else ("超出Token预算" if zh else (f"token budget exceeded after {took}" if took else "token budget exceeded"))
             )
         elif reason in ("MAX_INVOCATIONS", "MAX_FORCED_INVOCATIONS"):
             status = (
-                f"达到步数上限 ({took})" if (zh and took)
+                f"达到步数上限（{took}）" if (zh and took)
                 else ("达到步数上限" if zh else (f"max steps reached after {took}" if took else "max steps reached"))
             )
         elif reason == "TERMINAL_CUSTOM_HOOK":
             status = (
-                f"被钩子中止 ({took})" if (zh and took)
+                f"被钩子中止（{took}）" if (zh and took)
                 else ("被钩子中止" if zh else (f"stopped by hook after {took}" if took else "stopped by hook"))
             )
         else:
             status = (
-                f"任务失败 ({took})" if (zh and took)
+                f"任务失败（{took}）" if (zh and took)
                 else ("任务失败" if zh else (f"turn failed after {took}" if took else "turn failed"))
             )
     else:
         if is_bg_wakeup:
             status = (
-                f"后台任务完成 ({took})" if (zh and took)
+                f"后台任务完成（{took}）" if (zh and took)
                 else ("后台任务完成" if zh else (f"task done in {took}" if took else "task done"))
             )
         elif not fully_idle:
             status = (
-                f"已回复 ({took}) · 后台运行中" if (zh and took)
+                f"已回复（{took}）· 后台运行中" if (zh and took)
                 else ("已回复 · 后台运行中" if zh else (f"replied in {took} · bg running" if took else "replied · bg running"))
             )
         else:
             status = (
-                f"已完成 ({took})" if (zh and took)
+                f"已完成（{took}）" if (zh and took)
                 else ("已完成" if zh else (f"done in {took}" if took else "done"))
             )
 
@@ -1100,14 +1414,46 @@ def _build_question_notification(
         plain_text(question_text) or ("需要你选择一项后继续执行。" if zh else "Waiting for your answer to continue."),
         cfg["body_max"],
     )
-    return subtitle, body, cfg["sound"]
+    return subtitle, body, cfg["prompt_sound"]
+
+
+def _build_permission_notification(
+    project: str, label: str, cfg: Dict[str, Any], is_subagent: bool = False
+) -> Optional[Tuple[str, str, str]]:
+    if not cfg["notify_on_permission"]:
+        return None
+
+    zh = cfg["lang"] == "zh"
+    status = "等待权限确认" if zh else "waiting for permission"
+    subtitle = f"{project} · {status}"
+
+    if is_subagent:
+        raw_body = (
+            "子代理操作需要你确认权限后继续执行。"
+            if zh
+            else "A subagent is waiting for your approval to continue."
+        )
+    else:
+        clean_label = plain_text(label)
+        if zh:
+            raw_body = PERMISSION_LABELS_ZH.get(
+                clean_label, f"操作“{clean_label}”需要你确认权限。"
+            )
+        else:
+            raw_body = PERMISSION_LABELS_EN.get(
+                clean_label, f"Action '{clean_label}' is waiting for your permission."
+            )
+
+    body = clip_text(raw_body, cfg["body_max"])
+    return subtitle, body, cfg["prompt_sound"]
 
 
 def send_macos_notification(
     title: str, subtitle: str, body: str, sound: str, sound_mode: str = "notification"
 ) -> Tuple[bool, str]:
     dry_run_file = os.environ.get("DONE_NOTIFY_DRY_RUN_FILE")
-    if dry_run_file:
+    dry_run_jsonl = os.environ.get("DONE_NOTIFY_DRY_RUN_JSONL")
+    if dry_run_file or dry_run_jsonl:
         record = {
             "title": title,
             "subtitle": subtitle,
@@ -1115,8 +1461,12 @@ def send_macos_notification(
             "sound": sound,
             "sound_mode": sound_mode,
         }
-        with open(dry_run_file, "w", encoding="utf-8") as fh:
-            json.dump(record, fh, ensure_ascii=False)
+        if dry_run_file:
+            with open(dry_run_file, "w", encoding="utf-8") as fh:
+                json.dump(record, fh, ensure_ascii=False)
+        if dry_run_jsonl:
+            with open(dry_run_jsonl, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         return True, "dry-run recorded"
 
     notif_sound = sound if sound_mode in ("notification", "both") else ""
@@ -1158,6 +1508,203 @@ def send_macos_notification(
                 pass
 
     return ok, err_msg
+
+
+def _run_prompt_watcher(
+    agy_pid: int, initial_project: str, start_offset: Optional[int] = None
+) -> int:
+    """Tail the owning `agy` CLI log for surfaced permission and question prompts."""
+    if sys.platform != "darwin" or agy_pid <= 1 or not _pid_alive(agy_pid):
+        return 0
+
+    existing = _inspect_prompt_watcher_status(agy_pid)
+    if existing.get("running") and int(existing.get("watcher_pid") or 0) != os.getpid():
+        return 0
+
+    stop_requested = False
+
+    def _on_signal(_signum: int, _frame: Any) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    agy_lstart = _process_lstart(agy_pid)
+    watcher_lstart = _process_lstart(os.getpid())
+
+    log_path = ""
+    for _ in range(10):
+        if stop_requested or not _pid_alive(agy_pid):
+            return 0
+        log_path = _resolve_cli_log_path(agy_pid)
+        if log_path and os.path.isfile(log_path):
+            break
+        time.sleep(WATCHER_POLL_SEC)
+
+    if not log_path or not os.path.isfile(log_path):
+        return 0
+
+    state_path = _watcher_state_path(agy_pid)
+    try:
+        _atomic_write_json(
+            state_path,
+            {
+                "watcher_pid": os.getpid(),
+                "watcher_lstart": watcher_lstart,
+                "agy_pid": agy_pid,
+                "agy_lstart": agy_lstart,
+                "log_path": log_path,
+                "started_at": time.time(),
+            },
+        )
+    except OSError:
+        return 0
+
+    seen_events: Set[Tuple[str, str, str]] = set()
+    partial_buf = b""
+    deadline = time.monotonic() + WATCHER_MAX_LIFETIME_SEC
+    last_lstart_check = time.monotonic()
+
+    try:
+        with open(log_path, "rb") as fh:
+            try:
+                init_size = os.path.getsize(log_path)
+            except OSError:
+                init_size = 0
+            if start_offset is not None and 0 <= start_offset <= init_size:
+                fh.seek(start_offset)
+            else:
+                fh.seek(init_size)
+
+            while not stop_requested and time.monotonic() < deadline:
+                if not _pid_alive(agy_pid):
+                    break
+
+                now_mono = time.monotonic()
+                if now_mono - last_lstart_check >= WATCHER_LSTART_CHECK_SEC:
+                    last_lstart_check = now_mono
+                    if agy_lstart:
+                        cur_lstart = _process_lstart(agy_pid)
+                        if cur_lstart and cur_lstart != agy_lstart:
+                            break
+
+                try:
+                    cur_size = os.path.getsize(log_path)
+                    if cur_size < fh.tell():
+                        fh.seek(0)
+                        partial_buf = b""
+                except OSError:
+                    break
+
+                chunk = fh.read()
+                if not chunk:
+                    time.sleep(WATCHER_POLL_SEC)
+                    continue
+
+                data = partial_buf + chunk
+                raw_lines = data.split(b"\n")
+                partial_buf = raw_lines.pop()
+
+                for raw_line in raw_lines:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r")
+                    gmatch = GLOG_LINE_RE.match(line)
+                    if not gmatch:
+                        continue
+                    msg = gmatch.group("msg")
+
+                    if msg.startswith("CLI program exited, shutting down") or msg.startswith(
+                        "Terminal gone, shutting down"
+                    ):
+                        stop_requested = True
+                        break
+
+                    event_kind = ""
+                    target_id = ""
+                    step_str = ""
+                    label = ""
+
+                    m_tool = TOOL_CONFIRM_RE.match(msg)
+                    if m_tool:
+                        event_kind = "tool"
+                        label = _unescape_go_quoted(m_tool.group("label"))
+                        step_str = m_tool.group("step")
+                    else:
+                        m_sub = SUBAGENT_QUEUE_RE.match(msg)
+                        if m_sub:
+                            event_kind = "subagent"
+                            target_id = m_sub.group("subagent")
+                            step_str = m_sub.group("step")
+                        else:
+                            m_ask = ASK_QUESTION_LOG_RE.match(msg)
+                            if m_ask:
+                                event_kind = "question"
+                                step_str = m_ask.group("step")
+
+                    if not event_kind:
+                        continue
+
+                    dedup_key = (event_kind, target_id, step_str)
+                    if dedup_key in seen_events:
+                        continue
+                    if len(seen_events) >= 1024:
+                        seen_events.clear()
+                    seen_events.add(dedup_key)
+
+                    cfg = load_config()
+                    if not cfg["enabled"]:
+                        continue
+
+                    ctx = _read_json_file(_watcher_context_path(agy_pid))
+                    project = str((ctx or {}).get("project") or "").strip() or initial_project or "agy"
+
+                    notif: Optional[Tuple[str, str, str]] = None
+                    if event_kind == "question":
+                        if not cfg["notify_on_question"] or _recent_question_marker(agy_pid):
+                            continue
+                        zh = cfg["lang"] == "zh"
+                        subtitle = f"{project} · {'等待你的确认' if zh else 'waiting for input'}"
+                        body = (
+                            "需要你回答问题后继续执行。"
+                            if zh
+                            else "Waiting for your answer to continue."
+                        )
+                        notif = (subtitle, body, cfg["prompt_sound"])
+                    elif event_kind == "subagent":
+                        notif = _build_permission_notification(
+                            project, "", cfg, is_subagent=True
+                        )
+                    else:
+                        notif = _build_permission_notification(
+                            project, label, cfg, is_subagent=False
+                        )
+
+                    if notif is None:
+                        continue
+
+                    focus = inspect_focus_state(
+                        focus_mode=cfg["prompt_focus_mode"], target_pid=agy_pid
+                    )
+                    if not focus.get("is_interactive", True) or focus.get("focused", False):
+                        continue
+
+                    subtitle, body, sound = notif
+                    send_macos_notification(
+                        title=cfg["title"],
+                        subtitle=subtitle,
+                        body=body,
+                        sound=sound,
+                        sound_mode=cfg["sound_mode"],
+                    )
+    finally:
+        cur_state = _read_json_file(state_path)
+        if cur_state and int(cur_state.get("watcher_pid") or 0) == os.getpid():
+            try:
+                os.unlink(state_path)
+            except OSError:
+                pass
+
+    return 0
 
 
 def _is_subagent_payload(payload: Dict[str, Any]) -> bool:
@@ -1220,18 +1767,29 @@ def _run_hook() -> int:
         if cfg["cli_only"] and _is_non_cli_surface(payload):
             return _emit(response)
 
+        if event in ("SessionStart", "PreInvocation"):
+            if cfg["notify_on_permission"] or cfg["notify_on_question"]:
+                agy_pid, is_interactive = _find_ancestor_agy_pid()
+                if is_interactive and agy_pid > 1:
+                    _ensure_prompt_watcher(agy_pid, _project_name(payload))
+            return _emit(response)
+
         if event == "Stop":
             reason = str(payload.get("terminationReason") or "NO_TOOL_CALL")
             if reason == "USER_CANCELED":
                 return _emit(response)
+            active_focus_mode = cfg["focus_mode"]
         elif event == "PreToolUse":
             tool_name = str(((payload.get("toolCall") or {}).get("name") or ""))
             if tool_name != "ask_question" or not cfg["notify_on_question"]:
                 return _emit(response)
+            agy_pid, _ = _find_ancestor_agy_pid()
+            _record_question_marker(agy_pid)
+            active_focus_mode = cfg["prompt_focus_mode"]
         else:
             return _emit(response)
 
-        focus = inspect_focus_state(focus_mode=cfg["focus_mode"])
+        focus = inspect_focus_state(focus_mode=active_focus_mode)
         if not focus.get("is_interactive", True) or focus.get("focused", False):
             return _emit(response)
 
@@ -1269,7 +1827,7 @@ def _run_cli(argv: List[str]) -> int:
     parser.add_argument(
         "--status",
         action="store_true",
-        help="Show current terminal host detection and macOS focus status.",
+        help="Show current terminal host detection, watcher state, and macOS focus status.",
     )
     parser.add_argument(
         "--test",
@@ -1280,6 +1838,16 @@ def _run_cli(argv: List[str]) -> int:
         "--error",
         action="store_true",
         help="With --test, send a failure-style notification using error_sound.",
+    )
+    parser.add_argument(
+        "--question",
+        action="store_true",
+        help="With --test, send a question-prompt notification using prompt_sound.",
+    )
+    parser.add_argument(
+        "--permission",
+        action="store_true",
+        help="With --test, send a permission-prompt notification using prompt_sound.",
     )
     parser.add_argument(
         "--respect-focus",
@@ -1304,7 +1872,18 @@ def _run_cli(argv: List[str]) -> int:
         action="store_true",
         help="Reset configuration back to defaults.",
     )
+    parser.add_argument("--watch-prompts", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--agy-pid", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--project", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--start-offset", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.watch_prompts:
+        return _run_prompt_watcher(
+            agy_pid=args.agy_pid,
+            initial_project=args.project,
+            start_offset=args.start_offset,
+        )
 
     cfg = dict(DEFAULT_CONFIG) if args.reset_config else load_config()
     if args.reset_config and not args.updates:
@@ -1333,24 +1912,44 @@ def _run_cli(argv: List[str]) -> int:
 
     if args.status:
         state = inspect_focus_state(focus_mode=cfg["focus_mode"])
+        agy_pid = int((state.get("host") or {}).get("agy_pid") or 0)
+        state["prompt_watcher"] = _inspect_prompt_watcher_status(agy_pid)
         state["config_path"] = _config_path()
         state["config"] = cfg
         print(json.dumps(state, indent=2, ensure_ascii=False))
 
     if args.test:
+        is_prompt_test = bool(args.question or args.permission)
         if args.respect_focus:
-            state = inspect_focus_state(focus_mode=cfg["focus_mode"])
+            mode_to_check = cfg["prompt_focus_mode"] if is_prompt_test else cfg["focus_mode"]
+            state = inspect_focus_state(focus_mode=mode_to_check)
             if state.get("focused"):
                 print(f"Skipped test notification because CLI is currently focused ({state.get('reason')}).")
                 return 0
         project = os.path.basename(os.getcwd().rstrip("/")) or "agy"
         zh = cfg["lang"] == "zh"
-        if args.error:
-            subtitle = f"{project} · {'任务失败 (3s)' if zh else 'turn failed after 3s'}"
+        if args.permission:
+            subtitle = f"{project} · {'等待权限确认' if zh else 'waiting for permission'}"
+            body = (
+                "测试通知：终端命令执行需要你确认权限。"
+                if zh
+                else "Test notification: A command is waiting for your permission."
+            )
+            sound = cfg["prompt_sound"]
+        elif args.question:
+            subtitle = f"{project} · {'等待你的确认' if zh else 'waiting for input'}"
+            body = (
+                "测试通知：需要你回答问题后继续执行。"
+                if zh
+                else "Test notification: Waiting for your answer to continue."
+            )
+            sound = cfg["prompt_sound"]
+        elif args.error:
+            subtitle = f"{project} · {'任务失败（3s）' if zh else 'turn failed after 3s'}"
             body = "测试通知：模拟任务失败提醒。" if zh else "Test notification: simulated failed turn alert."
             sound = cfg["error_sound"]
         else:
-            subtitle = f"{project} · {'已完成 (3s)' if zh else 'done in 3s'}"
+            subtitle = f"{project} · {'已完成（3s）' if zh else 'done in 3s'}"
             body = "测试通知：回答完毕提醒已正常工作。" if zh else "Test notification: Done Notify banner and sound are active."
             sound = cfg["sound"]
         ok, err = send_macos_notification(

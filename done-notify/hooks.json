@@ -1,9 +1,16 @@
 {
   "done-notify": {
-    "Stop": [
+    "SessionStart": [
       {
         "type": "command",
-        "command": "python3 ./skills/done-notify/scripts/done-notify.py",
+        "command": "/usr/bin/python3 ./skills/done-notify/scripts/done-notify.py",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "/usr/bin/python3 ./skills/done-notify/scripts/done-notify.py",
         "timeout": 10
       }
     ],
@@ -13,10 +20,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./skills/done-notify/scripts/done-notify.py",
+            "command": "/usr/bin/python3 ./skills/done-notify/scripts/done-notify.py",
             "timeout": 10
           }
         ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "/usr/bin/python3 ./skills/done-notify/scripts/done-notify.py",
+        "timeout": 10
       }
     ]
   }
