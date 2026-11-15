@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """macOS Notification Center + sound notifier for Antigravity CLI (agy).
 
-Modeled on Claude Code's local `done-notify` plugin, extended with:
-- Terminal and tab focus detection for completed/failed turns (`Stop`).
-- Immediate sound + banner alerts when `agy` pauses for user input
-  (`ask_question`) or waits for user permission approval (`Surfacing tool
-  confirmation` / queued subagent approval).
+Modeled on Claude Code's local `done-notify` plugin:
+- Plays a macOS system sound + Notification Center banner when a turn finishes,
+  fails, or completes a background task (`Stop`), regardless of focus by default
+  (`focus_mode="always"`), with optional terminal/tab focus suppression
+  (`focus_mode="tab"` or `"app"`).
+- Plays a prompt sound + banner when `agy` pauses for user input (`ask_question`)
+  or waits for user permission approval (`Surfacing tool confirmation` / queued
+  subagent approval).
 """
 
 from __future__ import annotations
@@ -170,7 +173,7 @@ PRETOOL_QUESTION_DEDUP_SEC = 8.0
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": True,
-    "focus_mode": "tab",            # "tab" | "app" | "always" (for Stop completion/failure)
+    "focus_mode": "always",         # "always" | "tab" | "app" (for Stop completion/failure)
     "prompt_focus_mode": "always",  # "always" | "tab" | "app" (for question & permission prompts)
     "sound": "Glass",               # macOS sound on completed turns
     "prompt_sound": "Ping",         # macOS sound on question & permission prompts
@@ -804,7 +807,9 @@ def _check_kitty_window_focused(kitty_win_id: str, listen_on: str) -> Optional[T
 
 
 def inspect_focus_state(
-    focus_mode: str = "tab", target_pid: Optional[int] = None
+    focus_mode: str = "always",
+    target_pid: Optional[int] = None,
+    include_frontmost: bool = False,
 ) -> Dict[str, Any]:
     """Inspect CLI interactivity, terminal ownership, and current macOS focus."""
     ps_table = _read_ps_table()
@@ -894,7 +899,7 @@ def inspect_focus_state(
             "focused": False,
             "reason": "focus_mode=always (notify regardless of focus)",
             "host": host_summary,
-            "frontmost": {},
+            "frontmost": _query_frontmost_app() if include_frontmost else {},
         }
 
     front = _query_frontmost_app()
@@ -1911,7 +1916,9 @@ def _run_cli(argv: List[str]) -> int:
         print(json.dumps({"config_path": _config_path(), "config": cfg}, indent=2, ensure_ascii=False))
 
     if args.status:
-        state = inspect_focus_state(focus_mode=cfg["focus_mode"])
+        state = inspect_focus_state(
+            focus_mode=cfg["focus_mode"], include_frontmost=True
+        )
         agy_pid = int((state.get("host") or {}).get("agy_pid") or 0)
         state["prompt_watcher"] = _inspect_prompt_watcher_status(agy_pid)
         state["config_path"] = _config_path()

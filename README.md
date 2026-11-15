@@ -2,7 +2,7 @@
 
 Zero-dependency productivity plugins for Google Antigravity CLI (`agy`), modeled on local Claude Code mods:
 
-- **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes or fails while unfocused, or when `agy` pauses waiting for a question answer (`ask_question`) or user permission approval.
+- **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes, fails, asks a question (`ask_question`), or pauses waiting for user permission approval (alerts even while focused by default, with optional terminal/tab focus suppression).
 - **[`token-weather`](./token-weather)** — Live weather-themed `statusLine` band showing execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), context window fill tier, 5-hour & weekly quota usage and pacing, 8-turn sparkline, token delta, prompt cache TTL countdown, active subagents/tasks, cost, and Git branch.
 
 ---
@@ -29,34 +29,31 @@ agy plugin list
 
 [`done-notify`](./done-notify) wires lightweight `SessionStart`, `PreInvocation`, `PreToolUse` (`^ask_question$`), and `Stop` hooks with zero latency on auto-approved tools:
 
-- **Turn completion & background task wakeups**: Posts `<project> · done in <duration>` (or `task done in <duration>` for reactive background task wakeups) with a plain-text summary of the final answer and plays `Glass` when the CLI is unfocused.
-- **Turn failure or budget/step limits**: Posts `<project> · turn failed after <duration>` with the error summary and plays `Sosumi` when the CLI is unfocused.
+- **Turn completion & background task wakeups**: Posts `<project> · done in <duration>` (or `task done in <duration>` for reactive background task wakeups) with a plain-text summary of the final answer and plays `Glass`.
+- **Turn failure or budget/step limits**: Posts `<project> · turn failed after <duration>` with the error summary and plays `Sosumi`.
 - **Interactive question prompts (`ask_question`)**: Immediately posts `<project> · waiting for input` with the question text and plays `Ping` (`prompt_sound`) when `agy` pauses for an answer.
 - **Permission confirmation prompts**: Tails the owning `agy` CLI session log and posts `<project> · waiting for permission` with `Ping` (`prompt_sound`) at the exact moment `agy` surfaces a tool confirmation dialog (unsandboxed commands, sensitive command checks, out-of-workspace file access/edits, MCP/URL/browser confirmations, `--mode default` tool approvals, or subagent approval queues). Auto-approved tools and commands covered by an existing `"Always allow"` rule never chime, and the watcher exits automatically when `agy` closes.
-- **Independent focus controls (`focus_mode` & `prompt_focus_mode`)**: Turn-end alerts default to `focus_mode=tab`, querying `/usr/bin/lsappinfo` (~3 ms, zero TCC/Accessibility prompts) plus `/bin/ps` ancestry and active tab/pane state (`tmux`, `Terminal.app`, `iTerm2`, `WezTerm`, `Kitty`) so you are not interrupted while already viewing the CLI. Mid-turn blocking prompts (`ask_question` and permission requests) default to `prompt_focus_mode=always` so integrated terminals such as VS Code still chime even when another editor tab or window is frontmost. Automatically skips `USER_CANCELED` turns, child subagent turns, SSH sessions, and headless `agy -p` / `acp` invocations.
+- **Always-on by default, with optional focus filtering**: Both `focus_mode` and `prompt_focus_mode` default to `always` so you get an audible cue even when the terminal window is focused. If you prefer silence while actively viewing the CLI, set `--set focus_mode=tab` (or `app`) to check the frontmost macOS app via `/usr/bin/lsappinfo` plus active tab/pane state for `tmux`, `Terminal.app`, `iTerm2`, `WezTerm`, and `Kitty`. Automatically skips `USER_CANCELED` turns, child subagent turns, SSH sessions, and headless `agy -p` / `acp` invocations.
 
 ### Quick Test & Configuration
 
 Preferences persist in `~/.config/agy-done-notify/config.json` and take effect immediately without restarting `agy`:
 
 ```bash
-# Test completion, question, permission, and failure alerts (ignores focus)
+# Test completion, question, permission, and failure alerts
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --test
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --test --question
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --test --permission
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --test --error
 
-# Test focus gating: switch to another app/tab within 3 seconds
-sleep 3 && python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --test --respect-focus
-
-# Inspect detected host terminal, prompt watcher status, and live focus state
+# Inspect detected host terminal, prompt watcher status, and active config
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --status
 
 # Common settings
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --set lang=zh
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --set sound=Glass --set prompt_sound=Ping --set error_sound=Sosumi
-python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --set focus_mode=tab          # tab | app | always
-python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --set prompt_focus_mode=always # always | tab | app
+python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --set focus_mode=always        # always (default) | tab | app
+python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --set prompt_focus_mode=always # always (default) | tab | app
 python3 ~/.gemini/config/plugins/done-notify/skills/done-notify/scripts/done-notify.py --set min_duration_sec=5
 ```
 
