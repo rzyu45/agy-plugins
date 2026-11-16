@@ -4,6 +4,7 @@ Zero-dependency productivity plugins for Google Antigravity CLI (`agy`), modeled
 
 - **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes, fails, asks a question (`ask_question`), or pauses waiting for user permission approval (alerts even while focused by default, with optional terminal/tab focus suppression).
 - **[`token-weather`](./token-weather)** — Live weather-themed `statusLine` band showing execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), context window fill tier, 5-hour & weekly quota usage and pacing, 8-turn sparkline, token delta, prompt cache TTL countdown, active subagents/tasks, cost, and Git branch.
+- **[Maximum Context Window (`900K` / `1M` Tier)](#3-maximum-context-window-900k--1m-tier)** — Persistent `~/.gemini/antigravity-cli/settings.json` configuration for `agy`'s maximum `900K` context preset, valid preset enums, atomic merge snippet, and per-turn quota notes.
 
 ---
 
@@ -114,6 +115,63 @@ python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/toke
 ```
 
 See [`token-weather/skills/token-weather/references/README.md`](./token-weather/skills/token-weather/references/README.md) for Chinese documentation.
+
+---
+
+## 3. Maximum Context Window (`900K` / `1M` Tier)
+
+Set `"contextWindow": "900K"` in `~/.gemini/antigravity-cli/settings.json` (Windows: `%USERPROFILE%\.gemini\antigravity-cli\settings.json`) to switch `agy`'s global default context capacity to its maximum preset permanently:
+
+```json
+{
+  "$schema": "https://antigravity.google/schemas/v1/settings.json",
+  "contextWindow": "900K"
+}
+```
+
+### Preset Tiers & Notes (`agy` `v1.5.9`)
+
+Verified against `agy`'s `backend.ParsePresetContextWindow`, `backend.ContextWindow.MaxTokenLimit`, `backend.ContextWindow.QuotaMultiplier` (`context_window.go`), and `model.renderQuotaNote` (`model_selector_context_window.go`), `agy` recognizes exactly three preset strings:
+
+| `"contextWindow"` | `MaxTokenLimit` | `/model` UI Quota Note (`QuotaMultiplier`) |
+| :--- | :--- | :--- |
+| `"256K"` (default) | `256,000` | Baseline (none) |
+| `"512K"` | `512,000` | `about 1.3x quota per turn` |
+| `"900K"` (`1M` tier) | `900,000` | `about 1.8x quota per turn` |
+
+- **Use `"900K"`, never `"1M"`**: `"1M"` is not a valid enum in `ParsePresetContextWindow` and silently falls back to `"256K"`.
+- **Run from a regular terminal outside `agy`**: `agy` guards `~/.gemini/antigravity-cli/settings.json` with a hardcoded system protection boundary (blocking agent `write_file`/`edit_file` calls because the file controls permissions and shell hooks), so apply the change in your own shell or editor.
+- **CLI `--settings` flag**: Do not pass `"$schema"` inline to `agy --settings '{...}'` (the CLI flag rejects unknown keys); `"$schema"` loads cleanly from `settings.json` on disk.
+- **Quota note**: The `1.3x` / `1.8x` values are the client's per-turn estimate shown in `/model` on models with selectable context presets; actual quota consumption is settled server-side.
+
+### One-Line Atomic Merge (macOS / Linux)
+
+Run this in a normal terminal to create or update `~/.gemini/antigravity-cli/settings.json` atomically while preserving all existing fields (`model`, `permissions`, `statusLine`, `trustedWorkspaces`, etc.) and validating the output JSON:
+
+```bash
+python3 -c '
+import json, os, tempfile
+p = os.path.expanduser("~/.gemini/antigravity-cli/settings.json")
+os.makedirs(os.path.dirname(p), exist_ok=True)
+d = json.load(open(p, "r", encoding="utf-8")) if os.path.exists(p) else {}
+merged = {
+    "$schema": "https://antigravity.google/schemas/v1/settings.json",
+    **d,
+    "contextWindow": "900K",
+}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), suffix=".tmp")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(merged, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+os.replace(tmp, p)
+' && python3 -m json.tool ~/.gemini/antigravity-cli/settings.json
+```
+
+### Verification
+
+Start a new `agy` session (or re-select your model in `/model`) and run `/context` inside `agy` to confirm the active context ceiling. If [`token-weather`](#2-token-weather-context--quota-forecast-status-line) is enabled, the status bar context denominator updates automatically on the next turn.
+
+See [`docs/max-context-window_zh.md`](./docs/max-context-window_zh.md) for Chinese documentation.
 
 ---
 
