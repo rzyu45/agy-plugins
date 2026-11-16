@@ -2,8 +2,8 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "token-weather",
   "displayName": "Token Weather",
-  "version": "1.2.0",
-  "description": "Live weather-themed context window forecast, execution mode badge (auto, plan, accept-edits, default), 5-hour and weekly quota usage & pacing, recent-turn sparkline, token delta, and prompt cache TTL status line for Antigravity CLI.",
+  "version": "1.3.0",
+  "description": "Three-line weather-themed statusLine band for Antigravity CLI showing execution mode and active model, 5-hour/weekly model quota and Google Colab remaining compute units, and context window forecast with sparkline and cache TTL.",
   "author": {
     "name": "Ruizhi Yu",
     "url": "https://github.com/rzyu45"
@@ -14,6 +14,6 @@
   "suggestedPrompts": [
     "Preview Token Weather status line styles",
     "Configure Token Weather options for agy CLI",
-    "Switch Token Weather to two-line quota layout"
+    "Refresh Google Colab compute units in Token Weather"
   ]
 }

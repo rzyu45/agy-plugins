@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,12 +18,30 @@ from typing import Any, Dict, List, Optional, Tuple
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 O_SERIES_RE = re.compile(r"\bo[134]\b")
 
+COLAB_BALANCE_RE = re.compile(
+    r"^Current balance:\s*([0-9]+(?:\.[0-9]+)?)\s*compute units\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+COLAB_RATE_RE = re.compile(
+    r"^Usage rate:\s*([0-9]+(?:\.[0-9]+)?)\s*/hr\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+COLAB_ASSIGN_RE = re.compile(
+    r"^Active assignments:\s*(\d+)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
 SPARK_UNICODE = "▁▂▃▄▅▆▇█"
 SPARK_ASCII = "._-=+*#%"
 
 FIVE_HOUR_WINDOW_SEC = 5 * 3600
 WEEKLY_WINDOW_SEC = 7 * 86400
 QUOTA_CACHE_TTL_SEC = 900
+
+COLAB_ACTIVE_TTL_SEC = 60
+COLAB_MAX_STALE_SEC = 7 * 86400
+COLAB_STALE_ACTIVE_SEC = 600
+COLAB_REFRESH_COOLDOWN_SEC = 30
 
 WEATHER_TIERS = (
     # (upper_bound_exclusive, glyph, ascii_glyph, en_label, zh_label, fg_256, bar_256, bold)
@@ -40,7 +60,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "show_git": True,
     "show_quota": True,
     "quota_metric": "used",
-    "lines": 1,
+    "show_colab": True,
+    "colab_ttl": 180,
+    "colab_auth": "auto",
+    "lines": 3,
     "show_mode": "always",
 }
 
@@ -57,6 +80,18 @@ def _state_dir() -> str:
         "TOKEN_WEATHER_STATE_DIR",
         os.path.join(tempfile.gettempdir(), "agy-token-weather"),
     )
+
+
+def _colab_cache_paths() -> List[str]:
+    state_cache = os.path.join(_state_dir(), "_colab_cache.json")
+    if "TOKEN_WEATHER_STATE_DIR" in os.environ:
+        return [state_cache]
+    persistent_cache = os.path.join(os.path.dirname(_default_config_path()), "colab_cache.json")
+    return [persistent_cache, state_cache]
+
+
+def _colab_refresh_stamp_path() -> str:
+    return os.path.join(_state_dir(), "_colab_refresh.json")
 
 
 def _to_int(val: Any, default: int = 0) -> int:
@@ -102,6 +137,14 @@ def _normalize_show_mode(val: Any, default: str = "always") -> str:
             return "non-default"
         if norm in ("off", "none", "0", "false", "no"):
             return "off"
+    return default
+
+
+def _normalize_colab_auth(val: Any, default: str = "auto") -> str:
+    if isinstance(val, str):
+        norm = val.strip().lower()
+        if norm in ("auto", "oauth2", "adc"):
+            return norm
     return default
 
 
@@ -152,6 +195,25 @@ def format_percent(pct: float) -> str:
     return f"{formatted}%"
 
 
+def format_cu(val: float) -> str:
+    """Format Colab compute units concisely (1000, 986.5, 999.92, 0)."""
+    val = max(0.0, float(val))
+    if val < 0.005:
+        return "0"
+    formatted = f"{val:.2f}".rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
+def format_rate(val: float) -> str:
+    """Format hourly compute-unit burn rate concisely (13.1, 1.9, 0.07)."""
+    val = max(0.0, float(val))
+    if val < 0.1:
+        formatted = f"{val:.2f}".rstrip("0").rstrip(".")
+    else:
+        formatted = f"{val:.1f}".rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
 def load_saved_config(path: Optional[str] = None) -> Dict[str, Any]:
     """Load persisted user preferences if available."""
     cfg_path = path or _default_config_path()
@@ -190,6 +252,13 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     env_qmetric = os.environ.get("TOKEN_WEATHER_QUOTA_METRIC")
     if env_qmetric:
         cfg["quota_metric"] = env_qmetric.strip().lower()
+    if "TOKEN_WEATHER_SHOW_COLAB" in os.environ:
+        cfg["show_colab"] = _parse_bool(os.environ["TOKEN_WEATHER_SHOW_COLAB"], cfg["show_colab"])
+    if "TOKEN_WEATHER_COLAB_TTL" in os.environ:
+        cfg["colab_ttl"] = max(15, _to_int(os.environ["TOKEN_WEATHER_COLAB_TTL"], cfg["colab_ttl"]))
+    env_cauth = os.environ.get("TOKEN_WEATHER_COLAB_AUTH")
+    if env_cauth:
+        cfg["colab_auth"] = _normalize_colab_auth(env_cauth, str(cfg["colab_auth"]))
     if "TOKEN_WEATHER_LINES" in os.environ:
         cfg["lines"] = _to_int(os.environ["TOKEN_WEATHER_LINES"], cfg["lines"])
     if "TOKEN_WEATHER_SHOW_MODE" in os.environ:
@@ -211,6 +280,12 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         cfg["show_quota"] = False
     if getattr(args, "quota_metric", None):
         cfg["quota_metric"] = args.quota_metric
+    if getattr(args, "no_colab", False):
+        cfg["show_colab"] = False
+    if getattr(args, "colab_ttl", None) is not None:
+        cfg["colab_ttl"] = max(15, args.colab_ttl)
+    if getattr(args, "colab_auth", None):
+        cfg["colab_auth"] = args.colab_auth
     if getattr(args, "lines", None) is not None:
         cfg["lines"] = args.lines
     if getattr(args, "no_mode", False):
@@ -227,7 +302,11 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     cfg["show_quota"] = _parse_bool(cfg.get("show_quota"), True)
     if cfg.get("quota_metric") not in ("used", "remaining"):
         cfg["quota_metric"] = "used"
-    cfg["lines"] = 2 if _to_int(cfg.get("lines"), 1) == 2 else 1
+    cfg["show_colab"] = _parse_bool(cfg.get("show_colab"), True)
+    cfg["colab_ttl"] = max(15, _to_int(cfg.get("colab_ttl"), 180))
+    cfg["colab_auth"] = _normalize_colab_auth(cfg.get("colab_auth"), "auto")
+    lines_val = _to_int(cfg.get("lines"), 3)
+    cfg["lines"] = lines_val if lines_val in (1, 2, 3) else 3
     cfg["show_mode"] = _normalize_show_mode(cfg.get("show_mode"), "always")
     return cfg
 
@@ -265,7 +344,7 @@ def update_config_key(updates: List[str]) -> Tuple[int, str]:
             if val_str.lower() not in ("en", "zh"):
                 return 2, f"Invalid lang '{val_str}'; expected 'en' or 'zh'"
             saved[key] = val_str.lower()
-        elif key in ("ascii", "show_git", "show_quota"):
+        elif key in ("ascii", "show_git", "show_quota", "show_colab"):
             if val_str.lower() not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
                 return 2, f"Invalid boolean '{val_str}' for {key}"
             saved[key] = _parse_bool(val_str)
@@ -283,10 +362,20 @@ def update_config_key(updates: List[str]) -> Tuple[int, str]:
             if val_str.lower() not in ("used", "remaining"):
                 return 2, f"Invalid quota_metric '{val_str}'; expected 'used' or 'remaining'"
             saved[key] = val_str.lower()
+        elif key == "colab_ttl":
+            parsed = _to_int(val_str, -1)
+            if parsed < 15:
+                return 2, f"Invalid colab_ttl '{val_str}'; expected integer >= 15"
+            saved[key] = parsed
+        elif key == "colab_auth":
+            norm = _normalize_colab_auth(val_str, "")
+            if not norm:
+                return 2, f"Invalid colab_auth '{val_str}'; expected 'auto', 'oauth2', or 'adc'"
+            saved[key] = norm
         elif key == "lines":
             parsed = _to_int(val_str, -1)
-            if parsed not in (1, 2):
-                return 2, f"Invalid lines '{val_str}'; expected 1 or 2"
+            if parsed not in (1, 2, 3):
+                return 2, f"Invalid lines '{val_str}'; expected 1, 2, or 3"
             saved[key] = parsed
         elif key == "show_mode":
             norm = _normalize_show_mode(val_str, "")
@@ -298,6 +387,206 @@ def update_config_key(updates: List[str]) -> Tuple[int, str]:
 
     write_atomic_json(cfg_path, saved)
     return 0, f"Updated {cfg_path}: {json.dumps(saved, ensure_ascii=False)}"
+
+
+def _find_colab_bin() -> Optional[str]:
+    override = os.environ.get("TOKEN_WEATHER_COLAB_BIN", "").strip()
+    if override:
+        return override if os.path.isfile(override) and os.access(override, os.X_OK) else None
+
+    found = shutil.which("colab")
+    if found:
+        return found
+
+    for candidate in (
+        os.path.expanduser("~/.local/bin/colab"),
+        "/opt/homebrew/bin/colab",
+        "/usr/local/bin/colab",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _read_colab_cache() -> Optional[Dict[str, Any]]:
+    best: Optional[Dict[str, Any]] = None
+    best_ts = -1.0
+    for path in _colab_cache_paths():
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict) or data.get("balance") is None:
+                continue
+            ts = _to_float(data.get("ts"), -1.0)
+            if ts > best_ts:
+                best_ts = ts
+                best = data
+        except (OSError, ValueError):
+            continue
+    return best
+
+
+def _write_colab_cache(entry: Dict[str, Any]) -> None:
+    for path in _colab_cache_paths():
+        try:
+            write_atomic_json(path, entry)
+        except OSError:
+            continue
+
+
+def _parse_colab_usage_output(stdout: str) -> Optional[Dict[str, Any]]:
+    m_bal = COLAB_BALANCE_RE.search(stdout)
+    if not m_bal:
+        return None
+    m_rate = COLAB_RATE_RE.search(stdout)
+    m_asgn = COLAB_ASSIGN_RE.search(stdout)
+    return {
+        "balance": max(0.0, _to_float(m_bal.group(1))),
+        "rate": max(0.0, _to_float(m_rate.group(1))) if m_rate else 0.0,
+        "assignments": max(0, _to_int(m_asgn.group(1))) if m_asgn else 0,
+    }
+
+
+def refresh_colab_cache(cfg: Dict[str, Any], now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Query `colab usage` non-interactively and update cached compute units."""
+    ts_now = time.time() if now is None else now
+    colab_bin = _find_colab_bin()
+    if not colab_bin:
+        return None
+
+    stamp_path = _colab_refresh_stamp_path()
+    try:
+        write_atomic_json(stamp_path, {"ts": ts_now, "pid": os.getpid()})
+    except OSError:
+        pass
+
+    auth_cfg = _normalize_colab_auth(cfg.get("colab_auth"), "auto")
+    if auth_cfg in ("oauth2", "adc"):
+        providers = [auth_cfg]
+    else:
+        providers = []
+        cached = _read_colab_cache()
+        if cached and cached.get("auth") in ("oauth2", "adc"):
+            providers.append(str(cached["auth"]))
+        for cand in ("oauth2", "adc"):
+            if cand not in providers:
+                providers.append(cand)
+
+    env = dict(os.environ)
+    env.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "8")
+
+    for provider in providers:
+        try:
+            proc = subprocess.run(
+                [colab_bin, f"--auth={provider}", "usage"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=12,
+                env=env,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+
+        if proc.returncode != 0:
+            continue
+
+        parsed = _parse_colab_usage_output(proc.stdout or "")
+        if parsed is not None:
+            entry = {
+                "ts": time.time(),
+                "balance": parsed["balance"],
+                "rate": parsed["rate"],
+                "assignments": parsed["assignments"],
+                "auth": provider,
+            }
+            _write_colab_cache(entry)
+            return entry
+
+    return None
+
+
+def _trigger_colab_refresh_async(now: float) -> None:
+    """Spawn a detached background process to refresh Colab usage without blocking statusLine."""
+    stamp_path = _colab_refresh_stamp_path()
+    try:
+        with open(stamp_path, "r", encoding="utf-8") as fh:
+            stamp = json.load(fh)
+        if isinstance(stamp, dict):
+            last_attempt = _to_float(stamp.get("ts"), -1.0)
+            if 0.0 <= now - last_attempt < COLAB_REFRESH_COOLDOWN_SEC:
+                return
+    except (OSError, ValueError):
+        pass
+
+    try:
+        write_atomic_json(stamp_path, {"ts": now, "pid": os.getpid()})
+    except OSError:
+        pass
+
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--refresh-colab", "--quiet"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _extract_colab_usage(
+    payload: Dict[str, Any],
+    cfg: Dict[str, Any],
+    now: float,
+) -> Optional[Dict[str, Any]]:
+    """Extract Colab compute-unit balance from payload or non-blocking cache."""
+    raw_colab = payload.get("colab")
+    if isinstance(raw_colab, dict) and raw_colab.get("balance") is not None:
+        return {
+            "balance": max(0.0, _to_float(raw_colab.get("balance"))),
+            "rate": max(0.0, _to_float(raw_colab.get("rate"))),
+            "assignments": max(0, _to_int(raw_colab.get("assignments"))),
+        }
+
+    if _find_colab_bin() is None:
+        return None
+
+    cached = _read_colab_cache()
+    if cached is None:
+        _trigger_colab_refresh_async(now)
+        return None
+
+    ts = _to_float(cached.get("ts"), -1.0)
+    age = now - ts
+    balance = max(0.0, _to_float(cached.get("balance")))
+    rate = max(0.0, _to_float(cached.get("rate")))
+    assignments = max(0, _to_int(cached.get("assignments")))
+
+    is_active = rate > 0.005 or assignments > 0
+    effective_ttl = (
+        min(cfg["colab_ttl"], COLAB_ACTIVE_TTL_SEC) if is_active else cfg["colab_ttl"]
+    )
+
+    if age < 0.0 or age > effective_ttl:
+        _trigger_colab_refresh_async(now)
+
+    if age > COLAB_MAX_STALE_SEC:
+        return None
+
+    if age > COLAB_STALE_ACTIVE_SEC:
+        rate = 0.0
+        assignments = 0
+
+    return {
+        "balance": balance,
+        "rate": rate,
+        "assignments": assignments,
+    }
 
 
 def _session_file(payload: Dict[str, Any]) -> Optional[str]:
@@ -883,6 +1172,99 @@ def _render_quota_segment(
     return _c256(dot, fg=240).join(items)
 
 
+def _render_colab_segment(
+    colab_info: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    include_active: bool = True,
+) -> str:
+    """Render Google Colab remaining compute units and optional active burn rate / VMs."""
+    if colab_info is None:
+        return ""
+
+    balance = max(0.0, _to_float(colab_info.get("balance")))
+    rate = max(0.0, _to_float(colab_info.get("rate")))
+    assignments = max(0, _to_int(colab_info.get("assignments")))
+
+    bold = False
+    if balance <= 10.0:
+        fg = 196
+        bold = True
+    elif balance <= 30.0:
+        fg = 203
+    elif balance <= 100.0:
+        fg = 214
+    else:
+        fg = 114
+
+    cu_num = format_cu(balance)
+    cu_text = f"余{cu_num} CU" if cfg["lang"] == "zh" else f"{cu_num} CU"
+    head = f"{_c256('Colab', fg=247)} {_c256(cu_text, fg=fg, bold=bold)}"
+
+    if not include_active or (rate <= 0.005 and assignments <= 0):
+        return head
+
+    sub_parts: List[str] = [head]
+    if rate > 0.005:
+        sub_parts.append(_c256(f"{format_rate(rate)}/h", fg=214))
+    if assignments > 0:
+        if cfg["lang"] == "zh":
+            vm_lbl = f"{assignments}实例"
+        else:
+            vm_lbl = "1 VM" if assignments == 1 else f"{assignments} VMs"
+        sub_parts.append(_c256(vm_lbl, fg=81))
+
+    dot = " * " if cfg["ascii"] else " · "
+    return _c256(dot, fg=240).join(sub_parts)
+
+
+def _build_usage_line(
+    q5h: Optional[Dict[str, Any]],
+    qwk: Optional[Dict[str, Any]],
+    colab_info: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    sep: str,
+    sep_width: int,
+    max_width: int,
+) -> str:
+    """Combine Model quota usage and Colab remaining compute units within max_width."""
+    q_variants: List[str] = []
+    if q5h is not None or qwk is not None:
+        for inc_reset, inc_bars in ((True, True), (True, False), (False, False)):
+            cand = _render_quota_segment(
+                q5h, qwk, cfg, include_reset=inc_reset, include_bars=inc_bars
+            )
+            if cand and cand not in q_variants:
+                q_variants.append(cand)
+
+    c_variants: List[str] = []
+    if colab_info is not None:
+        for inc_active in (True, False):
+            cand = _render_colab_segment(colab_info, cfg, include_active=inc_active)
+            if cand and cand not in c_variants:
+                c_variants.append(cand)
+
+    if q_variants and c_variants:
+        for q_cand in q_variants:
+            for c_cand in c_variants:
+                if display_width(q_cand) + sep_width + display_width(c_cand) <= max_width:
+                    return f"{q_cand}{sep}{c_cand}"
+        return _append_fitting_segments("", [q_variants[-1], c_variants[-1]], sep, sep_width, max_width)
+
+    if q_variants:
+        for q_cand in q_variants:
+            if display_width(q_cand) <= max_width:
+                return q_cand
+        return q_variants[-1]
+
+    if c_variants:
+        for c_cand in c_variants:
+            if display_width(c_cand) <= max_width:
+                return c_cand
+        return c_variants[-1]
+
+    return ""
+
+
 def _render_sparkline(mags: List[int], last_delta: int, ascii_mode: bool) -> str:
     if not mags:
         return ""
@@ -1006,7 +1388,7 @@ def render_status_line(
     cfg: Dict[str, Any],
     now: Optional[float] = None,
 ) -> str:
-    """Render 1- or 2-line weather-themed status band for Antigravity CLI."""
+    """Render 1-, 2-, or 3-line weather-themed status band for Antigravity CLI."""
     ts_now = time.time() if now is None else now
     tel = _extract_telemetry(payload)
     state = _update_session_state(payload, tel["used_tokens"], tel["cum_tokens"], ts_now)
@@ -1016,6 +1398,10 @@ def render_status_line(
     if cfg["show_quota"]:
         quota_buckets = _extract_quotas(payload, ts_now)
         q5h, qwk = _pick_quota_pair(quota_buckets, tel["model_match_str"])
+
+    colab_info: Optional[Dict[str, Any]] = None
+    if cfg["show_colab"]:
+        colab_info = _extract_colab_usage(payload, cfg, ts_now)
 
     glyph, ascii_glyph, en_lbl, zh_lbl, fg, bar_fg, bold = _get_weather_tier(tel["used_pct"])
     icon = ascii_glyph if cfg["ascii"] else glyph
@@ -1042,32 +1428,6 @@ def render_status_line(
     mode_compact = _render_mode_badge(
         tel["exec_mode"], tel["vim_mode"], cfg["show_mode"], compact=True
     )
-
-    seg1_base_full = f"{weather_str} {pct_str} {bar_str} {tokens_str}"
-    seg1_base_compact = f"{weather_str} {pct_str} {tokens_str}"
-    seg1_base_tiny = f"{weather_str} {pct_str}"
-
-    seg1_full = f"{mode_full} {seg1_base_full}" if mode_full else seg1_base_full
-    seg1_compact_mode = (
-        f"{mode_compact} {seg1_base_compact}" if mode_compact else seg1_base_compact
-    )
-    seg1_tiny_mode = f"{mode_compact} {seg1_base_tiny}" if mode_compact else seg1_base_tiny
-
-    if display_width(seg1_full) <= max_width:
-        seg1 = seg1_full
-        allow_tail = True
-    elif display_width(seg1_compact_mode) <= max_width:
-        seg1 = seg1_compact_mode
-        allow_tail = True
-    elif display_width(seg1_base_compact) <= max_width:
-        seg1 = seg1_base_compact
-        allow_tail = True
-    elif display_width(seg1_tiny_mode) <= max_width:
-        seg1 = seg1_tiny_mode
-        allow_tail = False
-    else:
-        seg1 = seg1_base_tiny
-        allow_tail = False
 
     sep = _c256(" | " if cfg["ascii"] else " │ ", fg=239)
     sep_width = display_width(sep)
@@ -1096,24 +1456,76 @@ def render_status_line(
 
     meta_seg = _render_meta_segment(tel, cfg)
 
+    seg1_base_full = f"{weather_str} {pct_str} {bar_str} {tokens_str}"
+    seg1_base_compact = f"{weather_str} {pct_str} {tokens_str}"
+    seg1_base_tiny = f"{weather_str} {pct_str}"
+
+    if cfg["lines"] == 3:
+        # Line 1: Mode and model (+ auxiliary session metadata)
+        line1 = _append_fitting_segments(
+            "", [mode_full, model_seg, meta_seg], sep, sep_width, max_width
+        )
+        if mode_full and model_seg and model_seg not in line1:
+            line1 = _append_fitting_segments(
+                "", [mode_compact, model_seg, meta_seg], sep, sep_width, max_width
+            )
+        if not line1 and (mode_compact or model_seg):
+            line1 = mode_compact or model_seg
+
+        # Line 2: Model usage and Colab usage
+        line2 = _build_usage_line(q5h, qwk, colab_info, cfg, sep, sep_width, max_width)
+
+        # Line 3: Context usage
+        if display_width(seg1_base_full) <= max_width:
+            ctx_base = seg1_base_full
+            allow_ctx_tail = True
+        elif display_width(seg1_base_compact) <= max_width:
+            ctx_base = seg1_base_compact
+            allow_ctx_tail = True
+        else:
+            ctx_base = seg1_base_tiny
+            allow_ctx_tail = False
+
+        line3 = (
+            _append_fitting_segments(ctx_base, [spark, cache_seg], sep, sep_width, max_width)
+            if allow_ctx_tail
+            else ctx_base
+        )
+
+        return "\n".join(line for line in (line1, line2, line3) if line)
+
+    seg1_full = f"{mode_full} {seg1_base_full}" if mode_full else seg1_base_full
+    seg1_compact_mode = (
+        f"{mode_compact} {seg1_base_compact}" if mode_compact else seg1_base_compact
+    )
+    seg1_tiny_mode = f"{mode_compact} {seg1_base_tiny}" if mode_compact else seg1_base_tiny
+
+    if display_width(seg1_full) <= max_width:
+        seg1 = seg1_full
+        allow_tail = True
+    elif display_width(seg1_compact_mode) <= max_width:
+        seg1 = seg1_compact_mode
+        allow_tail = True
+    elif display_width(seg1_base_compact) <= max_width:
+        seg1 = seg1_base_compact
+        allow_tail = True
+    elif display_width(seg1_tiny_mode) <= max_width:
+        seg1 = seg1_tiny_mode
+        allow_tail = False
+    else:
+        seg1 = seg1_base_tiny
+        allow_tail = False
+
     if cfg["lines"] == 2:
         line1 = (
             _append_fitting_segments(seg1, [spark, cache_seg], sep, sep_width, max_width)
             if allow_tail
             else seg1
         )
-        line2_segments: List[str] = []
-        if q5h is not None or qwk is not None:
-            for candidate in (
-                _render_quota_segment(q5h, qwk, cfg, include_reset=True, include_bars=True),
-                _render_quota_segment(q5h, qwk, cfg, include_reset=True, include_bars=False),
-                _render_quota_segment(q5h, qwk, cfg, include_reset=False, include_bars=False),
-            ):
-                if candidate and display_width(candidate) <= max_width:
-                    line2_segments.append(candidate)
-                    break
-        line2_segments.extend([model_seg, meta_seg])
-        line2 = _append_fitting_segments("", line2_segments, sep, sep_width, max_width)
+        usage_seg = _build_usage_line(q5h, qwk, colab_info, cfg, sep, sep_width, max_width)
+        line2 = _append_fitting_segments(
+            "", [usage_seg, model_seg, meta_seg], sep, sep_width, max_width
+        )
         return f"{line1}\n{line2}" if line2 else line1
 
     if not allow_tail:
@@ -1127,11 +1539,20 @@ def render_status_line(
             q_w = display_width(q_seg)
             if q_seg and cur_width + sep_width + q_w <= max_width:
                 line = f"{line}{sep}{q_seg}"
+                cur_width = display_width(line)
+                break
+
+    colab_seg_1l = ""
+    if colab_info is not None:
+        for inc_active in (True, False):
+            cand = _render_colab_segment(colab_info, cfg, include_active=inc_active)
+            if cand and cur_width + sep_width + display_width(cand) <= max_width:
+                colab_seg_1l = cand
                 break
 
     return _append_fitting_segments(
         line,
-        [spark, model_seg, cache_seg, meta_seg],
+        [colab_seg_1l, spark, model_seg, cache_seg, meta_seg],
         sep,
         sep_width,
         max_width,
@@ -1144,7 +1565,7 @@ def run_preview(cfg: Dict[str, Any]) -> int:
     samples = [
         (
             14.2,
-            1_048_576,
+            900_000,
             [12_000, 18_400, 24_100],
             24_100,
             20_857,
@@ -1158,10 +1579,13 @@ def run_preview(cfg: Dict[str, Any]) -> int:
             13_800,
             0.810,
             154_800,
+            1000.0,
+            0.0,
+            0,
         ),
         (
             36.8,
-            200_000,
+            900_000,
             [8_200, 14_500, 19_100, 11_400],
             11_400,
             41_200,
@@ -1175,10 +1599,13 @@ def run_preview(cfg: Dict[str, Any]) -> int:
             15_000,
             0.650,
             432_000,
+            942.5,
+            1.9,
+            1,
         ),
         (
             62.5,
-            200_000,
+            900_000,
             [9_000, 22_000, 15_300, 31_200, 18_700],
             18_700,
             88_500,
@@ -1192,10 +1619,13 @@ def run_preview(cfg: Dict[str, Any]) -> int:
             7_800,
             0.480,
             302_400,
+            618.4,
+            13.1,
+            1,
         ),
         (
             82.0,
-            200_000,
+            900_000,
             [14_000, 29_500, 18_200, 42_100, 25_000, 19_800],
             19_800,
             121_000,
@@ -1209,10 +1639,13 @@ def run_preview(cfg: Dict[str, Any]) -> int:
             3_900,
             0.250,
             172_800,
+            74.2,
+            0.0,
+            0,
         ),
         (
             94.5,
-            200_000,
+            900_000,
             [21_000, 35_000, 48_000, 19_000, 27_400, 38_600],
             -42_000,
             140_200,
@@ -1226,6 +1659,9 @@ def run_preview(cfg: Dict[str, Any]) -> int:
             1_500,
             0.080,
             86_400,
+            8.5,
+            13.1,
+            2,
         ),
     ]
 
@@ -1249,6 +1685,9 @@ def run_preview(cfg: Dict[str, Any]) -> int:
                 rst_5h,
                 rem_wk,
                 rst_wk,
+                colab_bal,
+                colab_rate,
+                colab_vms,
             ) in enumerate(samples):
                 conv_id = f"preview-{idx}"
                 exact_used = int(round(win * pct / 100.0))
@@ -1258,9 +1697,9 @@ def run_preview(cfg: Dict[str, Any]) -> int:
                     "cycle_mode": c_mode,
                     "terminal_width": 170,
                     "model": {
-                        "id": "gemini-3.8-flash",
-                        "display_name": "Gemini 3.8 Flash",
-                        "effort": "high",
+                        "id": "gemini-4-carbon",
+                        "display_name": "Gemini 4 Carbon",
+                        "effort": "High",
                     },
                     "context_window": {
                         "total_input_tokens": exact_used,
@@ -1275,14 +1714,19 @@ def run_preview(cfg: Dict[str, Any]) -> int:
                         },
                     },
                     "quota": {
-                        "gemini-5h": {
+                        "carbon-5h": {
                             "remaining_fraction": rem_5h,
                             "reset_in_seconds": rst_5h,
                         },
-                        "gemini-weekly": {
+                        "carbon-weekly": {
                             "remaining_fraction": rem_wk,
                             "reset_in_seconds": rst_wk,
                         },
+                    },
+                    "colab": {
+                        "balance": colab_bal,
+                        "rate": colab_rate,
+                        "assignments": colab_vms,
                     },
                     "cost": {"total_usd": usd},
                     "vcs": {"branch": branch, "dirty": dirty},
@@ -1299,7 +1743,7 @@ def run_preview(cfg: Dict[str, Any]) -> int:
                             "last_delta": delta,
                         },
                     )
-                if idx > 0 and cfg["lines"] == 2:
+                if idx > 0 and cfg["lines"] >= 2:
                     print()
                 print(render_status_line(payload, cfg, now=now))
         finally:
@@ -1325,7 +1769,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("used", "remaining"),
         help="Show quota as used or remaining percentage",
     )
-    parser.add_argument("--lines", type=int, choices=(1, 2), help="Number of status lines (1 or 2)")
+    parser.add_argument("--no-colab", action="store_true", help="Hide Google Colab compute-unit usage")
+    parser.add_argument(
+        "--colab-auth",
+        choices=("auto", "oauth2", "adc"),
+        help="Authentication mode for `colab usage` (auto, oauth2, or adc)",
+    )
+    parser.add_argument(
+        "--colab-ttl",
+        type=int,
+        help="Colab usage cache TTL in seconds (minimum 15)",
+    )
+    parser.add_argument(
+        "--refresh-colab",
+        action="store_true",
+        help="Refresh cached Google Colab compute-unit usage immediately",
+    )
+    parser.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--lines",
+        type=int,
+        choices=(1, 2, 3),
+        help="Number of status lines (1, 2, or 3; default 3)",
+    )
     parser.add_argument("--no-mode", action="store_true", help="Hide execution mode badge")
     parser.add_argument(
         "--show-mode",
@@ -1356,6 +1822,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.show_config:
         print(json.dumps(cfg, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.refresh_colab:
+        entry = refresh_colab_cache(cfg)
+        if entry is None:
+            if not args.quiet:
+                print("Failed to refresh Colab usage", file=sys.stderr)
+            return 1
+        if not args.quiet:
+            print(json.dumps(entry, ensure_ascii=False))
         return 0
 
     if args.preview:

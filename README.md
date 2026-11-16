@@ -3,7 +3,7 @@
 Zero-dependency productivity plugins for Google Antigravity CLI (`agy`), modeled on local Claude Code mods:
 
 - **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes, fails, asks a question (`ask_question`), or pauses waiting for user permission approval (alerts even while focused by default, with optional terminal/tab focus suppression).
-- **[`token-weather`](./token-weather)** — Live weather-themed `statusLine` band showing execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), context window fill tier, 5-hour & weekly quota usage and pacing, 8-turn sparkline, token delta, prompt cache TTL countdown, active subagents/tasks, cost, and Git branch.
+- **[`token-weather`](./token-weather)** — Live three-line weather-themed `statusLine` band organized into (1) execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model, and session metadata, (2) 5-hour & weekly model quota usage alongside Google Colab remaining compute units, and (3) context window fill tier, 8-turn sparkline, token delta, and prompt cache TTL countdown.
 - **[Maximum Context Window (`900K` / `1M` Tier)](#3-maximum-context-window-900k--1m-tier)** — Persistent `~/.gemini/antigravity-cli/settings.json` configuration for `agy`'s maximum `900K` context preset, valid preset enums, atomic merge snippet, and per-turn quota notes.
 
 ---
@@ -64,9 +64,13 @@ See [`done-notify/skills/done-notify/references/README.md`](./done-notify/skills
 
 ---
 
-## 2. `token-weather` (Context & Quota Forecast Status Line)
+## 2. `token-weather` (Three-Line Mode, Quota/Colab & Context Status Band)
 
-[`token-weather`](./token-weather) renders `agy`'s live `statusLine` JSON telemetry as a 1- or 2-line adaptive ANSI status bar:
+[`token-weather`](./token-weather) renders `agy`'s live `statusLine` JSON telemetry as a default 3-line adaptive ANSI status bar (with optional 2-line and 1-line compact modes):
+
+1. **Line 1 — Mode and model**: Execution mode badge (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model name with reasoning effort and live state (`thinking`), plus subagents, background tasks, session cost, and Git branch.
+2. **Line 2 — Model usage and Colab usage**: 5-hour and weekly model quota bars, percentages, pace warning (`↑`), and reset countdowns alongside Google Colab remaining compute units (`Colab 1000 CU` when idle, or `Colab 942.5 CU · 1.9/h · 1 VM` when a runtime is active, refreshed asynchronously in the background via `google-colab-cli`).
+3. **Line 3 — Context usage**: Weather forecast tier, context fill percentage, progress bar, `used/window` token count, 8-turn context magnitude sparkline with net token delta, and prompt cache hit/TTL countdown.
 
 | Context Fill | Tier (EN / ZH) | Meaning |
 | :--- | :--- | :--- |
@@ -102,14 +106,21 @@ To stack `token-weather` underneath `agy`'s built-in status bar instead of repla
 Preferences persist in `~/.config/agy-token-weather/config.json`:
 
 ```bash
-# Preview all 5 weather tiers (1-line and 2-line layouts)
+# Preview all 5 weather tiers (default 3-line layout, plus 2-line and 1-line options)
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --preview
+python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --preview --lang zh
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --preview --lines 2
+
+# Refresh cached Google Colab compute units immediately
+python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --refresh-colab
 
 # Common settings
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set lang=zh
-python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set lines=2
+python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set lines=3                  # 3 (default) | 2 | 1
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set quota_metric=remaining   # used | remaining
+python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set show_colab=true          # true | false
+python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set colab_auth=auto          # auto | oauth2 | adc
+python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set colab_ttl=180            # idle cache TTL in seconds (60s when active)
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set show_mode=always         # always | non-default | off
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set ascii=true
 ```
@@ -169,7 +180,7 @@ os.replace(tmp, p)
 
 ### Verification
 
-Start a new `agy` session (or re-select your model in `/model`) and run `/context` inside `agy` to confirm the active context ceiling. If [`token-weather`](#2-token-weather-context--quota-forecast-status-line) is enabled, the status bar context denominator updates automatically on the next turn.
+Start a new `agy` session (or re-select your model in `/model`) and run `/context` inside `agy` to confirm the active context ceiling. If [`token-weather`](#2-token-weather-three-line-mode-quotacolab--context-status-band) is enabled, the status bar context denominator updates automatically on the next turn.
 
 See [`docs/max-context-window_zh.md`](./docs/max-context-window_zh.md) for Chinese documentation.
 
