@@ -4,7 +4,7 @@ Zero-dependency productivity plugins for Google Antigravity CLI (`agy`), modeled
 
 - **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes, fails, asks a question (`ask_question`), or pauses waiting for user permission approval (alerts even while focused by default, with optional terminal/tab focus suppression).
 - **[`token-weather`](./token-weather)** — Live three-line weather-themed `statusLine` band organized into (1) execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model, and session metadata, (2) 5-hour & weekly model quota usage alongside Google Colab remaining compute units, and (3) context window fill tier, 8-turn sparkline, token delta, and prompt cache TTL countdown.
-- **[Maximum Context Window (`900K` / `1M` Tier)](#3-maximum-context-window-900k--1m-tier)** — Persistent `~/.gemini/antigravity-cli/settings.json` configuration for `agy`'s maximum `900K` context preset, valid preset enums, atomic merge snippet, and per-turn quota notes.
+- **[Maximum Context Window (`900K` / `1M` Tier)](#3-maximum-context-window-900k--1m-tier)**, how `agy` `v1.5.10` gates context compaction, why `"contextWindow": "900K"` in `settings.json` alone still compacts around 500K tokens, and how to unlock a `900,000`-token threshold on `Gemini 4 Argon` via `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
 
 ---
 
@@ -131,7 +131,28 @@ See [`token-weather/skills/token-weather/references/README.md`](./token-weather/
 
 ## 3. Maximum Context Window (`900K` / `1M` Tier)
 
-Set `"contextWindow": "900K"` in `~/.gemini/antigravity-cli/settings.json` (Windows: `%USERPROFILE%\.gemini\antigravity-cli\settings.json`) to switch `agy`'s global default context capacity to its maximum preset permanently:
+Although 1M-window models advertise a 1,000,000-token context window, `agy` `v1.5.10` triggers automatic conversation compaction from `CheckpointConfig.MaxTokenLimit`, which the server catalog sets around 500,000 to 512,000 tokens by default. Raising the compaction threshold to `900,000` tokens in public `agy` `v1.5.10` requires both selecting `Gemini 4 Argon` and setting `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
+
+```bash
+# Unlock a 900,000-token auto-compaction threshold on Gemini 4 Argon in agy v1.5.10
+AGY_CLI_AUTO_COMPACT_OVERRIDE=900000 agy --model "Gemini 4 Argon (High)"
+
+# Percentage syntax is also accepted by store.AutoCompactOverride and computes 90% of model maxTokens
+AGY_CLI_AUTO_COMPACT_OVERRIDE=90% agy --model "Gemini 4 Argon (High)"
+```
+
+To make the override persistent across interactive shells, export `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000` in `~/.zshrc` or `~/.bashrc`.
+
+### Why `"contextWindow": "900K"` Alone Still Compacts Around 500K in `agy` `v1.5.10`
+
+Disassembling `store.(*Store).ContextWindow` in `third_party/jetski/cli/store/context_window.go` at `0x102ef5bf0`, `ServerBackend.buildCascadeConfigInternal` in `third_party/jetski/cli/backend/server.go` at `0x1022e6f68`, and `utils.GetCheckpointConfigForModelInfo` at `0x1013f2900` reveals two client-side gates ahead of `settings.json`.
+
+- **Hardcoded `Gemini 4 Argon` model whitelist.** `Store.ContextWindow` and `SelectorModel.offersContextWindow` at `0x103144fa0` extract the active model family via `ModelEffortDisplay` at `0x102f43090` and check membership in the global slice at `0x10d3dcbc0`, which has length `1` and contains only `"Gemini 4 Argon"`. Selecting `"Gemini 4 Carbon (High)"` or `"Orchestrator (Carbon)"` causes `Store.ContextWindow` to return `""` immediately at `0x102ef5cd8`, before `AutoCompactOverride` at `0x102ef5cf0` is even called. Consequently, `Gemini 4 Carbon` ignores both `settings.json` and `AGY_CLI_AUTO_COMPACT_OVERRIDE` in `v1.5.10` and always compacts at its server-supplied `CheckpointConfig.MaxTokenLimit` of roughly 500,000 to 512,000 tokens.
+- **Unwired `"context-window-options"` feature flag on `settings.json` presets.** When `Gemini 4 Argon` is active, `Store.ContextWindow` first checks `AGY_CLI_AUTO_COMPACT_OVERRIDE` via `AutoCompactOverride` at `0x102ef59c0` and returns the override immediately at `0x102ef5d24` when non-empty, which `buildCascadeConfigInternal` writes into `CascadeConfig.CheckpointConfig.MaxTokenLimit` at `0x1022e6fbc`. When `AGY_CLI_AUTO_COMPACT_OVERRIDE` is unset, `Store.ContextWindow` at `0x102ef5cfc..0x102ef5d68` inlines `store.go` line 521 and asserts `*types.FeatureFlagReader` at `0x10a1ad5b0` on `Store+0x58` to check the `"context-window-options"` flag. Because no production backend injects `types.FeatureFlagReader` into `Store+0x58` and only the unit-test helper `Store.SetFeatureFlagForTest` at `0x102f496d0` populates that slot, the Go compiler eliminates the preset branch at compile time so every exit jumps to `0x102ef5d30` and returns `""`, leaving `Store.ContextWindowChoice` at `0x102ef5b90` with zero callers in the binary.
+
+### Forward-Compatible `settings.json` Preset Tiers in `agy` `v1.5.10`
+
+Keeping `"contextWindow": "900K"` in `~/.gemini/antigravity-cli/settings.json` on macOS/Linux or `%USERPROFILE%\.gemini\antigravity-cli\settings.json` on Windows passes schema validation cleanly and prepares your configuration for when Google enables the `"context-window-options"` feature flag in a public release.
 
 ```json
 {
@@ -140,24 +161,22 @@ Set `"contextWindow": "900K"` in `~/.gemini/antigravity-cli/settings.json` (Wind
 }
 ```
 
-### Preset Tiers & Notes (`agy` `v1.5.9`)
+Verified against `backend.ParsePresetContextWindow` at `0x1022d68a0`, `backend.ContextWindow.MaxTokenLimit` at `0x1022d6970`, `backend.ContextWindow.QuotaMultiplier` at `0x1022d6a20`, and `model.renderQuotaNote`, the preset table defines three valid strings.
 
-Verified against `agy`'s `backend.ParsePresetContextWindow`, `backend.ContextWindow.MaxTokenLimit`, `backend.ContextWindow.QuotaMultiplier` (`context_window.go`), and `model.renderQuotaNote` (`model_selector_context_window.go`), `agy` recognizes exactly three preset strings:
-
-| `"contextWindow"` | `MaxTokenLimit` | `/model` UI Quota Note (`QuotaMultiplier`) |
+| `"contextWindow"` | `MaxTokenLimit` | `/model` UI Quota Note |
 | :--- | :--- | :--- |
-| `"256K"` (default) | `256,000` | Baseline (none) |
+| `"256K"` | `256,000` | Baseline with no extra note |
 | `"512K"` | `512,000` | `about 1.3x quota per turn` |
-| `"900K"` (`1M` tier) | `900,000` | `about 1.8x quota per turn` |
+| `"900K"` | `900,000` | `about 1.8x quota per turn` |
 
-- **Use `"900K"`, never `"1M"`**: `"1M"` is not a valid enum in `ParsePresetContextWindow` and silently falls back to `"256K"`.
-- **Run from a regular terminal outside `agy`**: `agy` guards `~/.gemini/antigravity-cli/settings.json` with a hardcoded system protection boundary (blocking agent `write_file`/`edit_file` calls because the file controls permissions and shell hooks), so apply the change in your own shell or editor.
-- **CLI `--settings` flag**: Do not pass `"$schema"` inline to `agy --settings '{...}'` (the CLI flag rejects unknown keys); `"$schema"` loads cleanly from `settings.json` on disk.
-- **Quota note**: The `1.3x` / `1.8x` values are the client's per-turn estimate shown in `/model` on models with selectable context presets; actual quota consumption is settled server-side.
+- **Valid preset enum.** Write `"900K"` rather than `"1M"`, because `"1M"` is rejected by `ParsePresetContextWindow` and falls back to `"256K"`.
+- **System write-protection boundary.** Edit `~/.gemini/antigravity-cli/settings.json` from a regular terminal outside `agy`, because `agy` blocks agent `write_file` and `edit_file` calls on `settings.json`.
+- **CLI `--settings` flag.** Omit `"$schema"` when passing inline JSON to `agy --settings '{...}'` because the CLI flag rejects unknown keys, whereas `"$schema"` loads cleanly from `settings.json` on disk.
+- **Quota multiplier note.** The strings `about 1.3x quota per turn` and `about 1.8x quota per turn` are client-side estimates rendered in `/model`, while actual quota deduction is settled server-side.
 
-### One-Line Atomic Merge (macOS / Linux)
+### One-Line Atomic Merge for `settings.json`
 
-Run this in a normal terminal to create or update `~/.gemini/antigravity-cli/settings.json` atomically while preserving all existing fields (`model`, `permissions`, `statusLine`, `trustedWorkspaces`, etc.) and validating the output JSON:
+Run this snippet in a regular terminal to create or update `~/.gemini/antigravity-cli/settings.json` atomically while preserving all existing fields and validating the resulting JSON.
 
 ```bash
 python3 -c '
@@ -178,9 +197,42 @@ os.replace(tmp, p)
 ' && python3 -m json.tool ~/.gemini/antigravity-cli/settings.json
 ```
 
-### Verification
+### Local Binary Verification on macOS ARM64 `agy` `v1.5.10`
 
-Start a new `agy` session (or re-select your model in `/model`) and run `/context` inside `agy` to confirm the active context ceiling. If [`token-weather`](#2-token-weather-three-line-mode-quotacolab--context-status-band) is enabled, the status bar context denominator updates automatically on the next turn.
+You can verify both the single-element `["Gemini 4 Argon"]` whitelist at `0x10d3dcbc0` and the zero-caller status of `Store.ContextWindowChoice` at `0x102ef5b90` directly against your local `agy` binary.
+
+```bash
+/usr/bin/python3 -c '
+import shutil, struct
+agy_path = shutil.which("agy") or "/Users/Shared/agy"
+with open(agy_path, "rb") as f:
+    b = f.read()
+ncmds = struct.unpack_from("<I", b, 16)[0]
+off, segs = 32, []
+for _ in range(ncmds):
+    cmd, cmdsize = struct.unpack_from("<II", b, off)
+    if cmd == 0x19:
+        seg = b[off+8:off+24].split(b"\x00")[0].decode()
+        vma, vms, fo, fs = struct.unpack_from("<QQQQ", b, off+24)
+        segs.append((seg, vma, fo, fs))
+        if seg == "__TEXT":
+            nsects = struct.unpack_from("<I", b, off+64)[0]
+            for i in range(nsects):
+                so = off + 72 + i * 80
+                if b[so:so+16].split(b"\x00")[0] == b"__text":
+                    t_va, t_sz = struct.unpack_from("<QQ", b, so+32)
+                    t_fo = struct.unpack_from("<I", b, so+48)[0]
+    off += cmdsize
+va2fo = lambda va: next(fo + (va - vma) for _, vma, fo, fs in segs if vma <= va < vma + fs)
+ptr, slen, scap = struct.unpack_from("<QQQ", b, va2fo(0x10d3dcbc0))
+sptr, sslen = struct.unpack_from("<QQ", b, va2fo(ptr))
+print("whitelist:", [b[va2fo(sptr):va2fo(sptr)+sslen].decode()], f"(len={slen}, cap={scap})")
+callers = [hex(t_va + p - t_fo) for p in range(t_fo, t_fo + t_sz, 4)
+           if (struct.unpack_from("<I", b, p)[0] >> 26) == 0b100101 and
+           (t_va + p - t_fo) + ((struct.unpack_from("<I", b, p)[0] & 0x3ffffff) - ((1 << 26) if (struct.unpack_from("<I", b, p)[0] & 0x2000000) else 0)) * 4 == 0x102ef5b90]
+print("ContextWindowChoice (0x102ef5b90) callers:", callers)
+'
+```
 
 See [`docs/max-context-window_zh.md`](./docs/max-context-window_zh.md) for Chinese documentation.
 
