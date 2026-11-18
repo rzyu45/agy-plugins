@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "safe-allow",
   "displayName": "Safe Allow",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Smart PreToolUse policy guard for Antigravity CLI (agy) and /swarm subagents that auto-approves verified safe read-only, local document build, workspace edit/Python, read-only MCP, and GPU server SSH commands while keeping destructive operations gated for confirmation.",
   "author": {
     "name": "Ruizhi Yu",

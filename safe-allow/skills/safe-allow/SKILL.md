@@ -11,22 +11,27 @@ description: >-
 
 # Safe Allow for Antigravity CLI
 
-This skill bundles [safe-allow.py](./scripts/safe-allow.py), a zero-dependency `PreToolUse` hook guard for `agy` and `/swarm` workers that eliminates repetitive `Ctrl+K` approval prompts for safe operations without lowering guardrails on destructive commands.
+This skill bundles [safe-allow.py](./scripts/safe-allow.py), a zero-dependency `PreToolUse` hook guard and `settings.json` rule generator for `agy` and `/swarm` workers that eliminates repetitive `Ctrl+K` approval prompts for safe operations without lowering guardrails on destructive commands.
+
+In `agy` `v1.5.x`, `PreToolUse` hooks in `hooks.json` run on the main coordinator session, while `/swarm` workers evaluate `~/.gemini/antigravity-cli/settings.json` (`permissions.allow` / `permissions.ask` / `permissions.deny`) directly. After configuring `safe-allow`, run `--sync-settings` once in a regular terminal outside `agy` so `/swarm` workers inherit the same policy.
 
 ## Quick Actions
 
-1. Check active configuration and recent decision counts:
+1. Sync `safe-allow` categories and local SSH rules into `~/.gemini/antigravity-cli/settings.json` for `/swarm` workers (run in a regular terminal outside `agy`):
+   - `python3 ./scripts/safe-allow.py --sync-settings`
+   - Preview without writing: `python3 ./scripts/safe-allow.py --print-settings`
+2. Check active configuration and recent decision counts:
    - `python3 ./scripts/safe-allow.py --status`
-2. Inspect recent hook decisions (or only prompts gated with `ask`):
+3. Inspect recent hook decisions (or only prompts gated with `ask`):
    - `python3 ./scripts/safe-allow.py --recent --limit 20`
    - `python3 ./scripts/safe-allow.py --recent --ask-only`
-3. Dry-run a shell command check before running or debugging why a prompt appeared:
+4. Dry-run a shell command check before running or debugging why a prompt appeared:
    - `python3 ./scripts/safe-allow.py --check-cmd "cd docs && make pdf" --bypass-sandbox`
-4. Configure authorized remote SSH hosts and remote write prefixes (empty by default):
+5. Configure authorized remote SSH hosts and remote write prefixes (empty by default), then re-run `--sync-settings`:
    - `python3 ./scripts/safe-allow.py --add-ssh-target alice@gpu-server.example:2222`
    - `python3 ./scripts/safe-allow.py --add-ssh-prefix /data/alice`
    - `python3 ./scripts/safe-allow.py --clear-ssh-targets`
-5. Update persistent preferences in `~/.config/agy-safe-allow/config.json`:
+6. Update persistent preferences in `~/.config/agy-safe-allow/config.json`:
    - `python3 ./scripts/safe-allow.py --show-config`
    - `python3 ./scripts/safe-allow.py --set scope=subagents_only` (`all` or `subagents_only`)
    - `python3 ./scripts/safe-allow.py --set remote_gpu_ssh=false`

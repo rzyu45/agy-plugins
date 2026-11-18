@@ -2533,6 +2533,198 @@ def _apply_setting_update(cfg: Dict[str, Any], key: str, val: str) -> Optional[s
     return f"Unknown config key '{key}'. Valid keys: {', '.join(valid)}"
 
 
+def _default_settings_path() -> str:
+    return os.path.expanduser("~/.gemini/antigravity-cli/settings.json")
+
+
+def build_settings_rules(
+    cfg: Dict[str, Any], existing_settings: Dict[str, Any]
+) -> Tuple[List[str], List[str]]:
+    """Build Go-RE2-compatible permissions.allow and permissions.ask lists for agy settings.json."""
+    cats = cfg.get("categories") or {}
+    allow: List[str] = []
+    ask: List[str] = []
+
+    cd_prefix = r"(cd\s+[^\n;&|]+\s*(&&|;)\s*)*"
+
+    if cats.get("readonly_shell", True):
+        allow.append("read_file(*)")
+        allow.append(
+            f"command(regex:(?s)^{cd_prefix}"
+            r"(ls|pwd|wc|stat|file|du|df|which|whereis|type|uname|sw_vers|date|whoami|id|ps|pgrep|lsof|"
+            r"pmset\s+-g|cat|head|tail|nl|cut|sort|uniq|tr|diff|cmp|rg|grep|egrep|fgrep|find|fd|jq|yq|"
+            r"shasum|sha256sum|md5|pdfinfo|pdftotext|pdffonts|ffprobe|mediainfo|echo|printf|true)(\s|$).*)"
+        )
+        allow.append(
+            f"command(regex:(?s)^{cd_prefix}"
+            r"git\s+(-C\s+\S+\s+)*(--no-pager\s+)*"
+            r"(status|diff|log|show|rev-parse|ls-files|ls-tree|cat-file|blame|shortlog|describe|branch|tag|remote|stash\s+(list|show)|check-ignore)(\s|$).*)"
+        )
+
+    if cats.get("doc_and_edit", True):
+        allow.append(
+            f"command(regex:(?s)^{cd_prefix}"
+            r"(latexmk|xelatex|pdflatex|lualatex|bibtex|biber|makeindex|pdftoppm|pdftocairo|pdfunite|pdfseparate|pdfcrop|gs|qpdf|sips|officecli|make|mkdir|cp|mv|touch)(\s|$).*)"
+        )
+        allow.append(
+            f"command(regex:(?s)^{cd_prefix}"
+            r"git\s+(-C\s+\S+\s+)*(add|commit)(\s|$).*)"
+        )
+        home_real = _real_path("~")
+        for ws in existing_settings.get("trustedWorkspaces") or []:
+            if isinstance(ws, str) and ws.strip():
+                ws_real = _real_path(ws.strip())
+                if ws_real != home_real:
+                    rule = f"write_file({ws.strip()})"
+                    if rule not in allow:
+                        allow.append(rule)
+        for root_rule in (
+            "write_file(/tmp)",
+            "write_file(/private/tmp)",
+            f"write_file({os.path.expanduser('~/.gemini/antigravity-cli/brain')})",
+        ):
+            if root_rule not in allow:
+                allow.append(root_rule)
+
+    if cats.get("mcp_and_web", True):
+        allow.extend(
+            [
+                "read_url(*)",
+                "mcp(paper-search-mcp/*)",
+                "mcp(drawio/*)",
+            ]
+        )
+        for tool in sorted(ZOTERO_READ_TOOLS):
+            allow.append(f"mcp(zotero/{tool})")
+
+    if cats.get("workspace_python", True):
+        allow.append(
+            f"command(regex:(?s)^{cd_prefix}"
+            r"([A-Za-z_][A-Za-z0-9_]*=\S+\s+)*([^\s;&|]*/)?(python|python3|python3\.\d+|pytest|py\.test|ruff\s+check|mypy|flake8)(\s|$).*)"
+        )
+
+    if cats.get("remote_gpu_ssh", True):
+        targets_by_port: Dict[str, List[str]] = {}
+        for user, host, port in sorted(_parse_ssh_targets(cfg)):
+            targets_by_port.setdefault(port, []).append(f"{user}@{host}")
+        prefixes = _remote_write_prefixes(cfg)
+        prefixes_alt = "|".join(re.escape(p) for p in prefixes)
+        boundary = r"(/|\s|$|[\"'`])"
+        for port, host_specs in sorted(targets_by_port.items()):
+            hosts_alt = "|".join(re.escape(h) for h in host_specs)
+            if port == "22":
+                allow.append(
+                    f"command(regex:(?s)^{cd_prefix}ssh\\b.*({hosts_alt})\\b.*)"
+                )
+                allow.append(
+                    f"command(regex:(?s)^{cd_prefix}(rsync|scp)\\b.*({hosts_alt}):({prefixes_alt}){boundary}.*)"
+                )
+            else:
+                port_esc = re.escape(port)
+                allow.append(
+                    f"command(regex:(?s)^{cd_prefix}ssh\\b.*((-p\\s*{port_esc}\\b.*({hosts_alt}))|((\\b{hosts_alt})\\b.*-p\\s*{port_esc}\\b)).*)"
+                )
+                allow.append(
+                    f"command(regex:(?s)^{cd_prefix}(rsync|scp)\\b.*((-[pP]\\s*{port_esc}\\b.*({hosts_alt}):({prefixes_alt}){boundary})|((\\b{hosts_alt}):({prefixes_alt}){boundary}.*-[pP]\\s*{port_esc}\\b)).*)"
+                )
+
+    ask.extend(
+        [
+            r"command(regex:(?s)(^|[;&|\s\n(`\"'])(rm|rmdir|unlink|shred|srm|trash|truncate|dd|mkfs|fdisk|diskutil|sudo|su|doas|osascript|launchctl|csrutil|spctl|dscl|mount|umount|networksetup|scutil|pfctl|iptables|kill|killall|pkill|crontab|chown|chgrp|chmod|eval)(\s|$))",
+            r"command(regex:(?s)(--delete|--remove-source-files|-shell-escape|-enable-write18|-dNOSAFER|ProxyCommand|LocalCommand|\bsed\s+-[A-Za-z]*i|\bfind\b[^\n;&|]*\s-(delete|exec|execdir|ok)\b))",
+            r"command(regex:(?s)\bgit\s+([^\n;&|]*\s+)?(push|clean|rebase|filter-branch|filter-repo)\b|\bgit\s+reset\s+--(hard|merge)\b|\bgit\s+checkout\s+(--|-f|--force)\b|\bgit\s+branch\s+-[dD]\b|\bgit\s+tag\s+-d\b|\bgit\s+stash\s+(drop|clear)\b|\bgit\s+config\s+--(global|system)\b)",
+            r"command(regex:(?s)\b(pip|pip3|conda|mamba|micromamba|brew)\s+(install|uninstall|remove|upgrade|update|reinstall)\b)",
+            r"command(regex:(?s)\bpython[0-9.]*\b.*(\s-c\s|<<).*\b(rmtree|unlink|os\.remove|os\.rmdir|os\.system)\b)",
+            r"command(regex:(?s)\b(curl|wget)\b.*\|\s*(sh|bash|zsh|dash|python[0-9.]*|node|perl|ruby)\b)",
+            r"command(regex:(?s)(\.ssh/|id_ed25519|id_rsa|\.bashrc|\.zshrc|/etc/(passwd|shadow|sudoers)|antigravity-cli/settings\.json))",
+            "write_file(~/.ssh)",
+            "write_file(~/.gemini/antigravity-cli/settings.json)",
+            "write_file(~/.gemini/config)",
+        ]
+    )
+    return allow, ask
+
+
+def merge_settings_permissions(
+    cfg: Dict[str, Any], settings_path: str
+) -> Dict[str, Any]:
+    """Read settings_path if present and return merged JSON preserving existing keys."""
+    existing: Dict[str, Any] = {}
+    if os.path.isfile(settings_path):
+        with open(settings_path, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            existing = loaded
+
+    gen_allow, gen_ask = build_settings_rules(cfg, existing)
+    gen_allow_set = set(gen_allow)
+    gen_ask_set = set(gen_ask)
+
+    existing_perms = existing.get("permissions")
+    perms: Dict[str, Any] = dict(existing_perms) if isinstance(existing_perms, dict) else {}
+
+    old_allow = perms.get("allow") if isinstance(perms.get("allow"), list) else []
+    kept_allow = [
+        item
+        for item in old_allow
+        if not str(item).startswith("command(regex:(?s)") and item not in gen_allow_set
+    ]
+    perms["allow"] = kept_allow + gen_allow
+
+    old_ask = perms.get("ask") if isinstance(perms.get("ask"), list) else []
+    kept_ask = [
+        item
+        for item in old_ask
+        if not str(item).startswith("command(regex:(?s)") and item not in gen_ask_set
+    ]
+    merged_ask = kept_ask + gen_ask
+    if merged_ask:
+        perms["ask"] = merged_ask
+
+    merged = dict(existing)
+    if "$schema" not in merged:
+        merged["$schema"] = "https://antigravity.google/schemas/v1/settings.json"
+    merged["permissions"] = perms
+    return merged
+
+
+def write_synced_settings(cfg: Dict[str, Any], settings_path: str) -> Tuple[str, Optional[str], Dict[str, Any]]:
+    """Back up settings_path if it exists and atomically write merged permissions."""
+    merged = merge_settings_permissions(cfg, settings_path)
+    parent = os.path.dirname(os.path.abspath(settings_path))
+    os.makedirs(parent, exist_ok=True)
+    backup_path: Optional[str] = None
+    if os.path.isfile(settings_path):
+        backup_path = settings_path + ".bak"
+        with open(settings_path, "rb") as src_fh:
+            raw_old = src_fh.read()
+        fd_b, tmp_b = tempfile.mkstemp(prefix=".settings-bak-", suffix=".json", dir=parent)
+        try:
+            with os.fdopen(fd_b, "wb") as dst_fh:
+                dst_fh.write(raw_old)
+            os.replace(tmp_b, backup_path)
+        finally:
+            if os.path.exists(tmp_b):
+                try:
+                    os.unlink(tmp_b)
+                except OSError:
+                    pass
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(merged, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp_path, settings_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return settings_path, backup_path, merged
+
+
 def _run_cli(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Inspect, test, or configure Safe Allow PreToolUse guard."
@@ -2550,6 +2742,9 @@ def _run_cli(argv: List[str]) -> int:
     parser.add_argument("--add-ssh-target", action="append", default=[], metavar="USER@HOST[:PORT]", help="Authorize a remote SSH target.")
     parser.add_argument("--add-ssh-prefix", action="append", default=[], metavar="PATH", help="Authorize a remote POSIX write prefix.")
     parser.add_argument("--clear-ssh-targets", action="store_true", help="Clear configured remote_ssh targets and prefixes.")
+    parser.add_argument("--print-settings", action="store_true", help="Print merged settings.json permissions for /swarm workers.")
+    parser.add_argument("--sync-settings", action="store_true", help="Write merged permissions into settings.json (run outside agy).")
+    parser.add_argument("--settings-path", type=str, default=None, help="Override target settings.json path.")
     parser.add_argument("--reset-config", action="store_true", help="Reset config to defaults.")
     args = parser.parse_args(argv)
 
@@ -2651,6 +2846,27 @@ def _run_cli(argv: List[str]) -> int:
                     "cwd": args.cwd,
                     "category": outcome.category,
                     "response": outcome.to_hook_response(),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+
+    settings_target = os.path.expanduser(args.settings_path) if args.settings_path else _default_settings_path()
+    if args.print_settings:
+        merged = merge_settings_permissions(cfg, settings_target)
+        print(json.dumps(merged, indent=2, ensure_ascii=False))
+
+    if args.sync_settings:
+        written_path, bak_path, merged = write_synced_settings(cfg, settings_target)
+        perms = merged.get("permissions") or {}
+        print(
+            json.dumps(
+                {
+                    "settings_path": written_path,
+                    "backup_path": bak_path,
+                    "allow_count": len(perms.get("allow") or []),
+                    "ask_count": len(perms.get("ask") or []),
                 },
                 indent=2,
                 ensure_ascii=False,

@@ -1,6 +1,6 @@
 # Safe Allow for Antigravity CLI (`agy`)
 
-`safe-allow`通过`PreToolUse`生命周期钩子对主代理及`/swarm`后台子代理的工具调用进行逐段语义与路径校验，为确认安全的只读操作、本地文档编译、工作区文件与Python脚本运行、只读MCP查询及已授权远端SSH操作返回`allow`与`permissionOverrides`，从而减少`/swarm`模式下无法点选Always Allow的`Ctrl+K`中断；对高危或未知沙盒外操作则保持返回`ask`交由用户确认。
+`safe-allow`通过`PreToolUse`生命周期钩子与`settings.json`规则同步双层机制减少`Ctrl+K`中断。在`agy` `v1.5.x`中，`hooks.json`里的`PreToolUse`钩子仅作用于主协调代理，`/swarm`后台`worker`只读取`~/.gemini/antigravity-cli/settings.json`中的`permissions.allow`、`permissions.ask`与`permissions.deny`（严格按`Deny > Ask > Allow`优先级判定）。因此安装插件或变更配置后，需在`agy`外部终端运行一次`--sync-settings`，将已启用分类、本地`remote_ssh`白名单与高危`ask`拦截至静态Go RE2规则中，使`/swarm`子代理与主代理保持一致，同时高危指令仍由`ask`拦截并交由用户确认。
 
 ## 五类自动放行范围
 
@@ -26,6 +26,8 @@
 - 查看最近拦截记录：`python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --recent --ask-only`
 - 预演测试某条命令是否放行：`python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --check-cmd "cd docs && make pdf" --bypass-sandbox`
 - 添加已授权远端SSH主机与目录前缀：`python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --add-ssh-target alice@gpu-server.example:2222 --add-ssh-prefix /data/alice`
+- 同步生成`/swarm`子代理所需的`settings.json`规则（请在`agy`外部的普通终端运行，自动备份为`settings.json.bak`）：`python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --sync-settings`
+- 仅预览合并后的`settings.json`内容而不写入：`python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --print-settings`
 - 切换生效范围（仅子代理或全量）：`python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --set scope=subagents_only`
 - 开关单个分类：`python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --set remote_gpu_ssh=false`
 - 临时停用或卸载插件：`agy plugin disable safe-allow`或`agy plugin uninstall safe-allow`
