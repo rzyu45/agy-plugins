@@ -1,0 +1,16 @@
+{
+  "safe-allow": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 ./skills/safe-allow/scripts/safe-allow.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

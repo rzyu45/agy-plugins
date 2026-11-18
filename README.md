@@ -4,18 +4,20 @@ Zero-dependency productivity plugins for Google Antigravity CLI (`agy`), modeled
 
 - **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes, fails, asks a question (`ask_question`), or pauses waiting for user permission approval (alerts even while focused by default, with optional terminal/tab focus suppression).
 - **[`token-weather`](./token-weather)** — Live three-line weather-themed `statusLine` band organized into (1) execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model, conversation name, and session metadata, (2) 5-hour & weekly model quota usage alongside Google Colab remaining compute units, and (3) context window fill tier, 8-turn sparkline, token delta, and prompt cache TTL countdown.
-- **[Maximum Context Window (`900K` / `1M` Tier)](#3-maximum-context-window-900k--1m-tier)**, how `agy` `v1.5.10` gates context compaction, why `"contextWindow": "900K"` in `settings.json` alone still compacts around 500K tokens, and how to unlock a `900,000`-token threshold on `Gemini 4 Argon` via `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
+- **[`safe-allow`](./safe-allow)** — Smart `PreToolUse` policy guard for `/swarm` subagents and the main `agy` session that validates compound commands segment by segment and returns `allow` with `permissionOverrides` for verified safe operations while keeping destructive commands, credential accesses, and unconfigured hosts gated on `ask`.
+- **[Maximum Context Window (`900K` / `1M` Tier)](#4-maximum-context-window-900k--1m-tier)**, how `agy` `v1.5.10` gates context compaction, why `"contextWindow": "900K"` in `settings.json` alone still compacts around 500K tokens, and how to unlock a `900,000`-token threshold on `Gemini 4 Argon` via `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
 
 ---
 
 ## Installation
 
-Clone this repository and install either or both plugins with `agy plugin install`:
+Clone this repository and install any plugin with `agy plugin install`:
 
 ```bash
 git clone https://github.com/rzyu45/agy-plugins.git
 agy plugin install ./agy-plugins/done-notify
 agy plugin install ./agy-plugins/token-weather
+agy plugin install ./agy-plugins/safe-allow
 ```
 
 Verify installed plugins:
@@ -130,7 +132,44 @@ See [`token-weather/skills/token-weather/references/README.md`](./token-weather/
 
 ---
 
-## 3. Maximum Context Window (`900K` / `1M` Tier)
+## 3. `safe-allow` (PreToolUse Permission Guard for `/swarm` & CLI)
+
+[`safe-allow`](./safe-allow) registers a wildcard `PreToolUse` hook that inspects tool calls for both the main session and `/swarm` subagents (which have no "Always allow" button in the `Ctrl+K` approval queue). Verified non-destructive operations receive `"decision": "allow"` plus matching `permissionOverrides`, while destructive or unrecognized operations stay gated with `"ask"`:
+
+- **Read-only inspection (`readonly_shell`)**: Splits `&&`, `;`, and `|` pipelines and verifies every segment (such as `ls`, `rg`, `find` without `-delete`/`-exec`, `wc`, `jq`, `pdfinfo`, `pdftotext`, and read-only `git` subcommands), blocking reads against `~/.ssh`, `.env`, `*.pem`, and `*.key`.
+- **Local document builds & workspace edits (`doc_and_edit`)**: Allows `write_file`/`edit_file` inside the active workspace, brain directory, or `/tmp` (protecting `.git/`, `.agents/hooks.json`, `settings.json`, and credential paths), along with workspace `latexmk` (no `-e` or `-shell-escape`), `xelatex`/`pdflatex`, `biber`, `bibtex`, `make` document targets, `pdftoppm`, `officecli`, and local `git add`/`commit`.
+- **Read-only MCP & web reads (`mcp_and_web`)**: Allows `search_web`, `read_url`, `paper-search-mcp/*`, `drawio/*`, and read/search `zotero` tools while keeping mutating `zotero` tools (`delete`, `create`, `update`, `batch_update`, `merge_duplicates`) gated on `ask`.
+- **Workspace Python (`workspace_python`)**: Allows `pytest`, `python3 -m py_compile|pytest|unittest|json.tool`, scripts inside the workspace or `~/.gemini/config/{skills,plugins}`, and safe non-destructive sandboxed `python3 -c` snippets.
+- **Configured remote SSH (`remote_gpu_ssh`)**: Disabled for unconfigured hosts by default (`targets: []`). Once you register trusted `user@host[:port]` endpoints and POSIX write prefixes locally, safe `ssh`/`scp`/`rsync` (without `--delete` or port forwarding) against those targets are auto-allowed.
+- **Red-flag hard gate**: Even inside the sandbox, `rm`, `sudo`, `sed -i`, `rsync --delete`, `git push`, `git reset --hard`, `git clean`, package installs (`pip`/`conda`/`brew`), and `curl | sh` pipelines always return `ask`.
+
+### Configuration & Dry-Run Inspection
+
+Preferences persist in `~/.config/agy-safe-allow/config.json` (mode `0600`), and recent decisions are logged to `/tmp/agy-safe-allow-<uid>/audit.jsonl`:
+
+```bash
+# Inspect status, active config, and decision counts
+python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --status
+
+# View recent prompts that remained gated on ask
+python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --recent --ask-only
+
+# Dry-run a command check
+python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --check-cmd "cd docs && make pdf" --bypass-sandbox
+
+# Register an authorized remote SSH host and remote write prefix locally
+python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --add-ssh-target alice@gpu-server.example:2222 --add-ssh-prefix /data/alice
+
+# Optional scope or category toggles
+python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --set scope=subagents_only
+python3 ~/.gemini/config/plugins/safe-allow/skills/safe-allow/scripts/safe-allow.py --set remote_gpu_ssh=false
+```
+
+See [`safe-allow/skills/safe-allow/references/README.md`](./safe-allow/skills/safe-allow/references/README.md) for Chinese documentation.
+
+---
+
+## 4. Maximum Context Window (`900K` / `1M` Tier)
 
 Although 1M-window models advertise a 1,000,000-token context window, `agy` `v1.5.10` triggers automatic conversation compaction from `CheckpointConfig.MaxTokenLimit`, which the server catalog sets around 500,000 to 512,000 tokens by default. Raising the compaction threshold to `900,000` tokens in public `agy` `v1.5.10` requires both selecting `Gemini 4 Argon` and setting `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
 

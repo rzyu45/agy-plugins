@@ -1,0 +1,19 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "safe-allow",
+  "displayName": "Safe Allow",
+  "version": "1.0.0",
+  "description": "Smart PreToolUse policy guard for Antigravity CLI (agy) and /swarm subagents that auto-approves verified safe read-only, local document build, workspace edit/Python, read-only MCP, and GPU server SSH commands while keeping destructive operations gated for confirmation.",
+  "author": {
+    "name": "Ruizhi Yu",
+    "url": "https://github.com/rzyu45"
+  },
+  "repository": "https://github.com/rzyu45/agy-plugins",
+  "category": "Productivity",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Check safe-allow status and recent PreToolUse decisions",
+    "Test whether a command is auto-allowed or gated by safe-allow",
+    "Configure safe-allow scope or category switches for agy CLI"
+  ]
+}
