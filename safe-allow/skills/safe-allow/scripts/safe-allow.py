@@ -2622,10 +2622,10 @@ def build_settings_rules(
             else:
                 port_esc = re.escape(port)
                 allow.append(
-                    f"command(regex:(?s)^{cd_prefix}ssh\\b.*((-p\\s*{port_esc}\\b.*({hosts_alt}))|((\\b{hosts_alt})\\b.*-p\\s*{port_esc}\\b)).*)"
+                    f"command(regex:(?s)^{cd_prefix}ssh\\b.*((-p\\s*{port_esc}\\b.*({hosts_alt}))|(\\b({hosts_alt})\\b.*-p\\s*{port_esc}\\b)).*)"
                 )
                 allow.append(
-                    f"command(regex:(?s)^{cd_prefix}(rsync|scp)\\b.*((-[pP]\\s*{port_esc}\\b.*({hosts_alt}):({prefixes_alt}){boundary})|((\\b{hosts_alt}):({prefixes_alt}){boundary}.*-[pP]\\s*{port_esc}\\b)).*)"
+                    f"command(regex:(?s)^{cd_prefix}(rsync|scp)\\b.*((-[pP]\\s*{port_esc}\\b.*({hosts_alt}):({prefixes_alt}){boundary})|(\\b({hosts_alt}):({prefixes_alt}){boundary}.*-[pP]\\s*{port_esc}\\b)).*)"
                 )
 
     ask.extend(
