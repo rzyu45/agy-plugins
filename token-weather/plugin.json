@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "token-weather",
   "displayName": "Token Weather",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Three-line weather-themed statusLine band for Antigravity CLI showing execution mode, active model, and conversation name on line 1, 5-hour/weekly model quota and Google Colab remaining compute units on line 2, and context window forecast with sparkline and cache TTL on line 3.",
   "author": {
     "name": "Ruizhi Yu",

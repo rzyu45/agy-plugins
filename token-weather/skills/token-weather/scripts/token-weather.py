@@ -8,12 +8,14 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote as _url_quote
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 O_SERIES_RE = re.compile(r"\bo[134]\b")
@@ -978,17 +980,75 @@ def _extract_vim_mode(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _agy_app_data_dir() -> str:
+    for env_key in ("ANTIGRAVITY_APP_DATA_DIR", "JETSKI_APP_DATA_DIR"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            return os.path.expanduser(raw)
+    return os.path.expanduser("~/.gemini/antigravity-cli")
+
+
+def _summaries_db_path() -> str:
+    override = os.environ.get("TOKEN_WEATHER_SUMMARIES_DB", "").strip()
+    if override:
+        return override
+    if "TOKEN_WEATHER_STATE_DIR" in os.environ:
+        return ""
+    return os.path.join(_agy_app_data_dir(), "conversation_summaries.db")
+
+
 def _metadata_cache_path() -> str:
     override = os.environ.get("TOKEN_WEATHER_METADATA_PATH", "").strip()
     if override:
         return override
     if "TOKEN_WEATHER_STATE_DIR" in os.environ:
         return ""
-    return os.path.expanduser("~/.gemini/antigravity-cli/cache/conversation_metadata.json")
+    return os.path.join(_agy_app_data_dir(), "cache", "conversation_metadata.json")
+
+
+def _query_summaries_db_title(db_path: str, conv_id: str) -> str:
+    """Read conversation title from agy's live SQLite summaries store (`conversation_summaries.db`)."""
+    if not db_path or not conv_id or not os.path.isfile(db_path):
+        return ""
+    encoded = _url_quote(os.path.abspath(db_path), safe="/:")
+    for query_suffix in ("mode=ro", "immutable=1"):
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(
+                f"file:{encoded}?{query_suffix}",
+                uri=True,
+                timeout=0.15,
+            )
+            row = conn.execute(
+                "SELECT title FROM conversation_summaries WHERE conversation_id = ? LIMIT 1",
+                (conv_id,),
+            ).fetchone()
+            if row and isinstance(row[0], str):
+                cleaned = _sanitize_single_line(row[0])
+                if cleaned:
+                    return cleaned
+            row_fts = conn.execute(
+                "SELECT title FROM conversations_fts WHERE chunk_index = -1 AND conversation_id = ? LIMIT 1",
+                (conv_id,),
+            ).fetchone()
+            if row_fts and isinstance(row_fts[0], str):
+                cleaned = _sanitize_single_line(row_fts[0])
+                if cleaned:
+                    return cleaned
+            return ""
+        except sqlite3.Error:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+    return ""
 
 
 def _extract_conversation_title(payload: Dict[str, Any]) -> str:
-    """Extract active conversation name from statusLine payload or metadata cache."""
+    """Extract active conversation name from statusLine payload, SQLite store, or JSON cache."""
     for key in ("conversation_title", "conversation_name", "session_name"):
         val = payload.get(key)
         if isinstance(val, str):
@@ -1006,8 +1066,15 @@ def _extract_conversation_title(payload: Dict[str, Any]) -> str:
                     return cleaned
 
     conv_id = str(payload.get("conversation_id") or payload.get("session_id") or "").strip()
+    if not conv_id:
+        return ""
+
+    db_title = _query_summaries_db_title(_summaries_db_path(), conv_id)
+    if db_title:
+        return db_title
+
     meta_path = _metadata_cache_path()
-    if conv_id and meta_path:
+    if meta_path:
         try:
             with open(meta_path, "r", encoding="utf-8") as fh:
                 meta = json.load(fh)
