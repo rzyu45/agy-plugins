@@ -43,6 +43,9 @@ COLAB_MAX_STALE_SEC = 7 * 86400
 COLAB_STALE_ACTIVE_SEC = 600
 COLAB_REFRESH_COOLDOWN_SEC = 30
 
+TITLE_MAX_COLS = 56
+TITLE_COMPACT_MAX_COLS = 30
+
 WEATHER_TIERS = (
     # (upper_bound_exclusive, glyph, ascii_glyph, en_label, zh_label, fg_256, bar_256, bold)
     (25.0, "☀", "*", "Clear", "晴朗", 220, 114, False),
@@ -65,6 +68,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "colab_auth": "auto",
     "lines": 3,
     "show_mode": "always",
+    "show_title": True,
 }
 
 
@@ -173,6 +177,53 @@ def display_width(text: str) -> int:
     return width
 
 
+def _sanitize_single_line(text: str) -> str:
+    """Strip ANSI SGR sequences and control characters, collapsing whitespace."""
+    plain = ANSI_RE.sub("", text)
+    chars: List[str] = []
+    for ch in plain:
+        code = ord(ch)
+        if ch in ("\r", "\n", "\t"):
+            chars.append(" ")
+        elif code < 32 or 0x7F <= code < 0xA0:
+            continue
+        else:
+            chars.append(ch)
+    return re.sub(r"\s+", " ", "".join(chars)).strip()
+
+
+def truncate_display(text: str, max_cols: int, ascii_mode: bool = False) -> str:
+    """Truncate plain text to at most `max_cols` terminal columns with an ellipsis."""
+    if not text or max_cols <= 0:
+        return ""
+    if display_width(text) <= max_cols:
+        return text
+
+    ellipsis = "..." if ascii_mode else "…"
+    ell_w = 3 if ascii_mode else 1
+    if max_cols <= ell_w:
+        return ("." * max_cols) if ascii_mode else ("…" if max_cols >= 1 else "")
+
+    budget = max_cols - ell_w
+    out: List[str] = []
+    used = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            if out:
+                out.append(ch)
+            continue
+        ch_w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + ch_w > budget:
+            break
+        out.append(ch)
+        used += ch_w
+
+    prefix = "".join(out).rstrip()
+    if not prefix:
+        return ("." * min(3, max_cols)) if ascii_mode else "…"
+    return f"{prefix}{ellipsis}"
+
+
 def format_tokens(n: int) -> str:
     """Format token count concisely (e.g., 850, 20.9k, 149.3k, 1.0M)."""
     n = max(0, int(n))
@@ -265,6 +316,10 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         cfg["show_mode"] = _normalize_show_mode(
             os.environ["TOKEN_WEATHER_SHOW_MODE"], str(cfg["show_mode"])
         )
+    if "TOKEN_WEATHER_SHOW_TITLE" in os.environ:
+        cfg["show_title"] = _parse_bool(
+            os.environ["TOKEN_WEATHER_SHOW_TITLE"], cfg["show_title"]
+        )
 
     if getattr(args, "lang", None):
         cfg["lang"] = args.lang
@@ -292,6 +347,8 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
         cfg["show_mode"] = "off"
     elif getattr(args, "show_mode", None):
         cfg["show_mode"] = args.show_mode
+    if getattr(args, "no_title", False):
+        cfg["show_title"] = False
 
     if cfg.get("lang") not in ("en", "zh"):
         cfg["lang"] = "en"
@@ -308,6 +365,7 @@ def resolve_config(args: argparse.Namespace) -> Dict[str, Any]:
     lines_val = _to_int(cfg.get("lines"), 3)
     cfg["lines"] = lines_val if lines_val in (1, 2, 3) else 3
     cfg["show_mode"] = _normalize_show_mode(cfg.get("show_mode"), "always")
+    cfg["show_title"] = _parse_bool(cfg.get("show_title"), True)
     return cfg
 
 
@@ -344,7 +402,7 @@ def update_config_key(updates: List[str]) -> Tuple[int, str]:
             if val_str.lower() not in ("en", "zh"):
                 return 2, f"Invalid lang '{val_str}'; expected 'en' or 'zh'"
             saved[key] = val_str.lower()
-        elif key in ("ascii", "show_git", "show_quota", "show_colab"):
+        elif key in ("ascii", "show_git", "show_quota", "show_colab", "show_title"):
             if val_str.lower() not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
                 return 2, f"Invalid boolean '{val_str}' for {key}"
             saved[key] = _parse_bool(val_str)
@@ -920,6 +978,57 @@ def _extract_vim_mode(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _metadata_cache_path() -> str:
+    override = os.environ.get("TOKEN_WEATHER_METADATA_PATH", "").strip()
+    if override:
+        return override
+    if "TOKEN_WEATHER_STATE_DIR" in os.environ:
+        return ""
+    return os.path.expanduser("~/.gemini/antigravity-cli/cache/conversation_metadata.json")
+
+
+def _extract_conversation_title(payload: Dict[str, Any]) -> str:
+    """Extract active conversation name from statusLine payload or metadata cache."""
+    for key in ("conversation_title", "conversation_name", "session_name"):
+        val = payload.get(key)
+        if isinstance(val, str):
+            cleaned = _sanitize_single_line(val)
+            if cleaned:
+                return cleaned
+
+    conv = payload.get("conversation")
+    if isinstance(conv, dict):
+        for key in ("title", "name"):
+            val = conv.get(key)
+            if isinstance(val, str):
+                cleaned = _sanitize_single_line(val)
+                if cleaned:
+                    return cleaned
+
+    conv_id = str(payload.get("conversation_id") or payload.get("session_id") or "").strip()
+    meta_path = _metadata_cache_path()
+    if conv_id and meta_path:
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            if isinstance(meta, dict):
+                convs = meta.get("conversations")
+                if isinstance(convs, dict):
+                    entry = convs.get(conv_id)
+                    if isinstance(entry, dict):
+                        summary = entry.get("summary")
+                        if isinstance(summary, dict):
+                            raw_title = summary.get("Title") or summary.get("title")
+                            if isinstance(raw_title, str):
+                                cleaned = _sanitize_single_line(raw_title)
+                                if cleaned:
+                                    return cleaned
+        except (OSError, ValueError):
+            pass
+
+    return ""
+
+
 def _extract_telemetry(payload: Dict[str, Any]) -> Dict[str, Any]:
     cw = payload.get("context_window")
     if not isinstance(cw, dict):
@@ -982,6 +1091,7 @@ def _extract_telemetry(payload: Dict[str, Any]) -> Dict[str, Any]:
     agent_state = str(payload.get("agent_state") or "").strip()
     exec_mode = _extract_exec_mode(payload)
     vim_mode = _extract_vim_mode(payload)
+    conv_title = _extract_conversation_title(payload)
 
     cost_raw = payload.get("cost")
     total_usd = 0.0
@@ -1025,6 +1135,7 @@ def _extract_telemetry(payload: Dict[str, Any]) -> Dict[str, Any]:
         "agent_state": agent_state,
         "exec_mode": exec_mode,
         "vim_mode": vim_mode,
+        "conv_title": conv_title,
         "total_usd": total_usd,
         "subagents": subagents,
         "tasks": tasks,
@@ -1383,6 +1494,102 @@ def _append_fitting_segments(
     return line
 
 
+def _render_conv_segment(
+    conv_title: str,
+    budget_cols: int,
+    ascii_mode: bool,
+    max_cap: int = TITLE_MAX_COLS,
+    min_trunc_cols: int = 10,
+) -> str:
+    """Render conversation name clipped to `min(max_cap, budget_cols)` columns."""
+    if not conv_title or budget_cols <= 0:
+        return ""
+    limit = min(max_cap, budget_cols)
+    natural_w = display_width(conv_title)
+    if natural_w <= limit:
+        return _c256(conv_title, fg=116)
+    if limit < min_trunc_cols:
+        return ""
+    clipped = truncate_display(conv_title, limit, ascii_mode=ascii_mode)
+    return _c256(clipped, fg=116) if clipped else ""
+
+
+def _build_line1_3l(
+    mode_full: str,
+    mode_compact: str,
+    model_seg: str,
+    conv_title: str,
+    meta_seg: str,
+    sep: str,
+    sep_width: int,
+    max_width: int,
+    ascii_mode: bool,
+) -> str:
+    """Build Line 1 in 3-line mode: [mode] │ model │ conversation_title │ meta."""
+    head_candidates: List[str] = []
+    h_full = _append_fitting_segments("", [mode_full, model_seg], sep, sep_width, max_width)
+    if mode_full and model_seg and model_seg not in h_full:
+        h_comp = _append_fitting_segments("", [mode_compact, model_seg], sep, sep_width, max_width)
+        if h_comp:
+            head_candidates.append(h_comp)
+    elif h_full:
+        head_candidates.append(h_full)
+        if mode_compact and mode_compact != mode_full:
+            h_comp = _append_fitting_segments(
+                "", [mode_compact, model_seg], sep, sep_width, max_width
+            )
+            if h_comp and h_comp not in head_candidates:
+                head_candidates.append(h_comp)
+
+    if not head_candidates and (mode_compact or model_seg):
+        fallback_head = mode_compact or model_seg
+        if display_width(fallback_head) <= max_width:
+            head_candidates.append(fallback_head)
+
+    if not conv_title:
+        if head_candidates:
+            return _append_fitting_segments(
+                head_candidates[0], [meta_seg], sep, sep_width, max_width
+            )
+        return _append_fitting_segments("", [meta_seg], sep, sep_width, max_width)
+
+    if meta_seg:
+        meta_cost = sep_width + display_width(meta_seg)
+        if head_candidates:
+            for head in head_candidates:
+                avail = max_width - display_width(head) - sep_width - meta_cost
+                conv_seg = _render_conv_segment(
+                    conv_title, avail, ascii_mode, max_cap=TITLE_MAX_COLS, min_trunc_cols=14
+                )
+                if conv_seg:
+                    return f"{head}{sep}{conv_seg}{sep}{meta_seg}"
+        else:
+            avail = max_width - meta_cost
+            conv_seg = _render_conv_segment(
+                conv_title, avail, ascii_mode, max_cap=TITLE_MAX_COLS, min_trunc_cols=14
+            )
+            if conv_seg:
+                return f"{conv_seg}{sep}{meta_seg}"
+
+    if head_candidates:
+        for idx, head in enumerate(head_candidates):
+            avail = max_width - display_width(head) - sep_width
+            min_cols = 12 if idx == 0 and len(head_candidates) > 1 else 6
+            conv_seg = _render_conv_segment(
+                conv_title, avail, ascii_mode, max_cap=TITLE_MAX_COLS, min_trunc_cols=min_cols
+            )
+            if conv_seg:
+                return f"{head}{sep}{conv_seg}"
+        return _append_fitting_segments(head_candidates[0], [meta_seg], sep, sep_width, max_width)
+
+    conv_only = _render_conv_segment(
+        conv_title, max_width, ascii_mode, max_cap=TITLE_MAX_COLS, min_trunc_cols=4
+    )
+    if conv_only:
+        return _append_fitting_segments(conv_only, [meta_seg], sep, sep_width, max_width)
+    return _append_fitting_segments("", [meta_seg], sep, sep_width, max_width)
+
+
 def render_status_line(
     payload: Dict[str, Any],
     cfg: Dict[str, Any],
@@ -1455,22 +1662,25 @@ def render_status_line(
     )
 
     meta_seg = _render_meta_segment(tel, cfg)
+    conv_title = tel["conv_title"] if cfg["show_title"] else ""
 
     seg1_base_full = f"{weather_str} {pct_str} {bar_str} {tokens_str}"
     seg1_base_compact = f"{weather_str} {pct_str} {tokens_str}"
     seg1_base_tiny = f"{weather_str} {pct_str}"
 
     if cfg["lines"] == 3:
-        # Line 1: Mode and model (+ auxiliary session metadata)
-        line1 = _append_fitting_segments(
-            "", [mode_full, model_seg, meta_seg], sep, sep_width, max_width
+        # Line 1: Mode, model, conversation name, and auxiliary session metadata
+        line1 = _build_line1_3l(
+            mode_full,
+            mode_compact,
+            model_seg,
+            conv_title,
+            meta_seg,
+            sep,
+            sep_width,
+            max_width,
+            cfg["ascii"],
         )
-        if mode_full and model_seg and model_seg not in line1:
-            line1 = _append_fitting_segments(
-                "", [mode_compact, model_seg, meta_seg], sep, sep_width, max_width
-            )
-        if not line1 and (mode_compact or model_seg):
-            line1 = mode_compact or model_seg
 
         # Line 2: Model usage and Colab usage
         line2 = _build_usage_line(q5h, qwk, colab_info, cfg, sep, sep_width, max_width)
@@ -1517,11 +1727,32 @@ def render_status_line(
         allow_tail = False
 
     if cfg["lines"] == 2:
-        line1 = (
-            _append_fitting_segments(seg1, [spark, cache_seg], sep, sep_width, max_width)
-            if allow_tail
-            else seg1
-        )
+        if allow_tail:
+            line1 = seg1
+            if conv_title:
+                tail_w = sum(sep_width + display_width(s) for s in (spark, cache_seg) if s)
+                avail_with_tail = max_width - display_width(seg1) - sep_width - tail_w
+                conv_2l = _render_conv_segment(
+                    conv_title,
+                    avail_with_tail,
+                    cfg["ascii"],
+                    max_cap=TITLE_MAX_COLS,
+                    min_trunc_cols=12,
+                )
+                if not conv_2l:
+                    avail_compact = max_width - display_width(seg1) - sep_width
+                    conv_2l = _render_conv_segment(
+                        conv_title,
+                        avail_compact,
+                        cfg["ascii"],
+                        max_cap=TITLE_COMPACT_MAX_COLS,
+                        min_trunc_cols=8,
+                    )
+                if conv_2l:
+                    line1 = f"{seg1}{sep}{conv_2l}"
+            line1 = _append_fitting_segments(line1, [spark, cache_seg], sep, sep_width, max_width)
+        else:
+            line1 = seg1
         usage_seg = _build_usage_line(q5h, qwk, colab_info, cfg, sep, sep_width, max_width)
         line2 = _append_fitting_segments(
             "", [usage_seg, model_seg, meta_seg], sep, sep_width, max_width
@@ -1533,6 +1764,18 @@ def render_status_line(
 
     line = seg1
     cur_width = display_width(line)
+    if conv_title:
+        conv_1l = _render_conv_segment(
+            conv_title,
+            max_width - cur_width - sep_width,
+            cfg["ascii"],
+            max_cap=TITLE_COMPACT_MAX_COLS,
+            min_trunc_cols=8,
+        )
+        if conv_1l:
+            line = f"{line}{sep}{conv_1l}"
+            cur_width = display_width(line)
+
     if q5h is not None or qwk is not None:
         for include_reset in (True, False):
             q_seg = _render_quota_segment(q5h, qwk, cfg, include_reset=include_reset)
@@ -1562,6 +1805,20 @@ def render_status_line(
 def run_preview(cfg: Dict[str, Any]) -> int:
     """Print realistic preview lines across all five weather tiers and modes."""
     now = time.time()
+    titles_en = (
+        "Token Weather Setup",
+        "Status Line Quota Layout",
+        "Colab Runtime Benchmark",
+        "Paper Revision Response",
+        "Release Verification",
+    )
+    titles_zh = (
+        "状态栏插件配置",
+        "配额与布局优化",
+        "Colab算力基准测试",
+        "审稿意见回复修改",
+        "发布前回归验证",
+    )
     samples = [
         (
             14.2,
@@ -1690,9 +1947,11 @@ def run_preview(cfg: Dict[str, Any]) -> int:
                 colab_vms,
             ) in enumerate(samples):
                 conv_id = f"preview-{idx}"
+                conv_title = titles_zh[idx] if cfg["lang"] == "zh" else titles_en[idx]
                 exact_used = int(round(win * pct / 100.0))
                 payload: Dict[str, Any] = {
                     "conversation_id": conv_id,
+                    "conversation_title": conv_title,
                     "agent_state": a_state,
                     "cycle_mode": c_mode,
                     "terminal_width": 170,
@@ -1798,6 +2057,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("always", "non-default", "off"),
         help="Control execution mode badge visibility",
     )
+    parser.add_argument("--no-title", action="store_true", help="Hide conversation name")
     parser.add_argument("--preview", action="store_true", help="Print sample lines for all 5 tiers")
     parser.add_argument(
         "--set",

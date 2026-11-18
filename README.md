@@ -3,7 +3,7 @@
 Zero-dependency productivity plugins for Google Antigravity CLI (`agy`), modeled on local Claude Code mods:
 
 - **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes, fails, asks a question (`ask_question`), or pauses waiting for user permission approval (alerts even while focused by default, with optional terminal/tab focus suppression).
-- **[`token-weather`](./token-weather)** — Live three-line weather-themed `statusLine` band organized into (1) execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model, and session metadata, (2) 5-hour & weekly model quota usage alongside Google Colab remaining compute units, and (3) context window fill tier, 8-turn sparkline, token delta, and prompt cache TTL countdown.
+- **[`token-weather`](./token-weather)** — Live three-line weather-themed `statusLine` band organized into (1) execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model, conversation name, and session metadata, (2) 5-hour & weekly model quota usage alongside Google Colab remaining compute units, and (3) context window fill tier, 8-turn sparkline, token delta, and prompt cache TTL countdown.
 - **[Maximum Context Window (`900K` / `1M` Tier)](#3-maximum-context-window-900k--1m-tier)**, how `agy` `v1.5.10` gates context compaction, why `"contextWindow": "900K"` in `settings.json` alone still compacts around 500K tokens, and how to unlock a `900,000`-token threshold on `Gemini 4 Argon` via `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
 
 ---
@@ -68,7 +68,7 @@ See [`done-notify/skills/done-notify/references/README.md`](./done-notify/skills
 
 [`token-weather`](./token-weather) renders `agy`'s live `statusLine` JSON telemetry as a default 3-line adaptive ANSI status bar (with optional 2-line and 1-line compact modes):
 
-1. **Line 1 — Mode and model**: Execution mode badge (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model name with reasoning effort and live state (`thinking`), plus subagents, background tasks, session cost, and Git branch.
+1. **Line 1 — Mode, model, and conversation**: Execution mode badge (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model name with reasoning effort and live state (`thinking`), active conversation name (`conversation_title`, updated immediately on `/rename`), plus subagents, background tasks, session cost, and Git branch.
 2. **Line 2 — Model usage and Colab usage**: 5-hour and weekly model quota bars, percentages, pace warning (`↑`), and reset countdowns alongside Google Colab remaining compute units (`Colab 1000 CU` when idle, or `Colab 942.5 CU · 1.9/h · 1 VM` when a runtime is active, refreshed asynchronously in the background via `google-colab-cli`).
 3. **Line 3 — Context usage**: Weather forecast tier, context fill percentage, progress bar, `used/window` token count, 8-turn context magnitude sparkline with net token delta, and prompt cache hit/TTL countdown.
 
@@ -122,6 +122,7 @@ python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/toke
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set colab_auth=auto          # auto | oauth2 | adc
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set colab_ttl=180            # idle cache TTL in seconds (60s when active)
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set show_mode=always         # always | non-default | off
+python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set show_title=true        # true | false
 python3 ~/.gemini/config/plugins/token-weather/skills/token-weather/scripts/token-weather.py --set ascii=true
 ```
 
