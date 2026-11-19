@@ -14,6 +14,7 @@ Modeled on Claude Code's local `done-notify` plugin:
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime, timezone
 import json
 import os
@@ -25,6 +26,8 @@ import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+import unicodedata
+from urllib.parse import unquote, urlparse
 
 OSASCRIPT_LINES = (
     "on run argv",
@@ -165,6 +168,16 @@ SUBAGENT_QUEUE_RE = re.compile(
 ASK_QUESTION_LOG_RE = re.compile(
     r"^Surfacing ask_question at step\s+(?P<step>\d+)\b"
 )
+CLI_STORE_WORKSPACE_RE = re.compile(
+    r"^Initializing CLI store manager for workspace\s+(?P<path>/.*)$"
+)
+LSOF_HEX_ESCAPE_RE = re.compile(r"(?:\\x[0-9a-fA-F]{2})+")
+
+_PROC_PIDVNODEPATHINFO = 9
+_PROC_VNODEPATHINFO_SIZE = 2352
+_PVI_CDIR_PATH_OFFSET = 152
+_MAXPATHLEN = 1024
+_LIBPROC_CACHE: Optional[Any] = None
 
 WATCHER_POLL_SEC = 0.20
 WATCHER_LSTART_CHECK_SEC = 30.0
@@ -1024,7 +1037,23 @@ def _find_ancestor_agy_pid() -> Tuple[int, bool]:
     return agy_pid, is_interactive
 
 
-def _resolve_cli_log_path(agy_pid: int) -> str:
+def _unescape_lsof_path(raw: str) -> str:
+    if "\\x" not in raw:
+        return raw
+
+    def _repl(match: re.Match[str]) -> str:
+        seq = match.group(0)
+        try:
+            return bytes(
+                int(seq[i + 2 : i + 4], 16) for i in range(0, len(seq), 4)
+            ).decode("utf-8", errors="replace")
+        except ValueError:
+            return seq
+
+    return LSOF_HEX_ESCAPE_RE.sub(_repl, raw)
+
+
+def _resolve_cli_log_path(agy_pid: int, allow_global_fallback: bool = True) -> str:
     """Resolve the active `cli-*.log` file held open by `agy_pid`."""
     override = os.environ.get("DONE_NOTIFY_CLI_LOG_FILE", "").strip()
     if override:
@@ -1032,19 +1061,26 @@ def _resolve_cli_log_path(agy_pid: int) -> str:
 
     if agy_pid > 1:
         try:
+            env = dict(os.environ)
+            env.pop("LC_ALL", None)
+            env["LC_CTYPE"] = "UTF-8"
             out = subprocess.check_output(
                 ["/usr/sbin/lsof", "-a", "-p", str(agy_pid), "-d", "1,2", "-Fn"],
                 stderr=subprocess.DEVNULL,
                 text=True,
                 timeout=1.5,
+                env=env,
             )
             for line in out.splitlines():
                 if line.startswith("n/"):
-                    candidate = line[1:].strip()
+                    candidate = _unescape_lsof_path(line[1:].strip())
                     if candidate.endswith(".log") and os.path.isfile(candidate):
                         return candidate
         except (OSError, subprocess.SubprocessError):
             pass
+
+    if not allow_global_fallback:
+        return ""
 
     log_dir = os.path.expanduser("~/.gemini/antigravity-cli/log")
     symlink_path = os.path.join(log_dir, "cli.log")
@@ -1299,20 +1335,289 @@ def _extract_turn_details(payload: Dict[str, Any]) -> Tuple[Optional[float], boo
     return duration_sec, is_bg_wakeup, answer_md
 
 
-def _project_name(payload: Dict[str, Any]) -> str:
-    cwd = str(payload.get("cwd") or "").strip()
-    if not cwd:
-        ws = payload.get("workspacePaths")
-        if isinstance(ws, list) and ws:
-            cwd = str(ws[0] or "").strip()
-    if not cwd:
-        cwd = os.getcwd()
-    base = os.path.basename(cwd.rstrip("/"))
-    return base or cwd
+def _normalize_compare_path(path: str) -> str:
+    raw = (path or "").strip()
+    if not raw:
+        return ""
+    resolved = _safe_realpath(raw)
+    norm = unicodedata.normalize("NFC", resolved)
+    if len(norm) > 1:
+        norm = norm.rstrip("/")
+    return norm
+
+
+def _same_path(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    na = _normalize_compare_path(a)
+    nb = _normalize_compare_path(b)
+    if na == nb:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _containment_depth(child: str, parent: str) -> Optional[int]:
+    """Return specificity score if `child` is strictly inside `parent`, else None."""
+    nc = _normalize_compare_path(child)
+    np = _normalize_compare_path(parent)
+    if not nc or not np or np == "/":
+        return None
+    if nc.startswith(np + os.sep):
+        return len(np)
+    if os.path.exists(nc) and os.path.exists(np):
+        cur = os.path.dirname(nc)
+        while cur and cur != "/" and cur != os.path.dirname(cur):
+            if _same_path(cur, np):
+                return len(np)
+            cur = os.path.dirname(cur)
+    return None
+
+
+def _get_process_cwd_darwin(pid: int) -> str:
+    """Return the current working directory of `pid` on macOS via libproc or lsof."""
+    global _LIBPROC_CACHE
+    if pid <= 1 or sys.platform != "darwin":
+        return ""
+    if _LIBPROC_CACHE is None:
+        try:
+            lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            fn = lib.proc_pidinfo
+            fn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            fn.restype = ctypes.c_int
+            _LIBPROC_CACHE = fn
+        except (OSError, AttributeError):
+            _LIBPROC_CACHE = False
+
+    if callable(_LIBPROC_CACHE):
+        try:
+            buf = ctypes.create_string_buffer(_PROC_VNODEPATHINFO_SIZE)
+            ret = _LIBPROC_CACHE(
+                pid,
+                _PROC_PIDVNODEPATHINFO,
+                0,
+                buf,
+                _PROC_VNODEPATHINFO_SIZE,
+            )
+            if ret == _PROC_VNODEPATHINFO_SIZE:
+                raw_path = buf.raw[
+                    _PVI_CDIR_PATH_OFFSET : _PVI_CDIR_PATH_OFFSET + _MAXPATHLEN
+                ].split(b"\x00", 1)[0]
+                decoded = raw_path.decode("utf-8", errors="replace").strip()
+                if decoded.startswith("/"):
+                    return decoded
+        except (OSError, ValueError):
+            pass
+
+    try:
+        env = dict(os.environ)
+        env.pop("LC_ALL", None)
+        env["LC_CTYPE"] = "UTF-8"
+        out = subprocess.check_output(
+            ["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.5,
+            env=env,
+        )
+        for line in out.splitlines():
+            if line.startswith("n/"):
+                candidate = _unescape_lsof_path(line[1:].strip())
+                if candidate.startswith("/"):
+                    return candidate
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return ""
+
+
+def _read_cli_log_workspace(agy_pid: int) -> str:
+    """Extract the primary launch workspace recorded at startup in `agy`'s CLI log."""
+    log_path = _resolve_cli_log_path(agy_pid, allow_global_fallback=False)
+    if not log_path or not os.path.isfile(log_path):
+        return ""
+    try:
+        with open(log_path, "rb") as fh:
+            head = fh.read(65536).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    for raw_line in head.splitlines():
+        gmatch = GLOG_LINE_RE.match(raw_line.rstrip("\r"))
+        if not gmatch:
+            continue
+        wmatch = CLI_STORE_WORKSPACE_RE.match(gmatch.group("msg"))
+        if wmatch:
+            candidate = wmatch.group("path").strip()
+            if candidate.startswith("/"):
+                return candidate
+    return ""
+
+
+def _get_agy_launch_cwd(agy_pid: int) -> str:
+    """Return the owning `agy` CLI process's launch workspace directory."""
+    if "DONE_NOTIFY_MOCK_AGY_CWD" in os.environ:
+        return os.environ.get("DONE_NOTIFY_MOCK_AGY_CWD", "").strip()
+    if agy_pid > 1:
+        cwd = _get_process_cwd_darwin(agy_pid)
+        if cwd:
+            return cwd
+    return _read_cli_log_workspace(agy_pid)
+
+
+def _default_cli_project_path() -> str:
+    if "DONE_NOTIFY_DEFAULT_PROJECT_JSON" in os.environ:
+        return os.environ.get("DONE_NOTIFY_DEFAULT_PROJECT_JSON", "").strip()
+    return os.path.expanduser("~/.gemini/config/projects/default-cli-project.json")
+
+
+def _file_uri_to_path(uri: str) -> str:
+    raw = (uri or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("/"):
+        return raw
+    parsed = urlparse(raw)
+    if parsed.scheme != "file":
+        return ""
+    path = unquote(parsed.path or "")
+    if parsed.netloc and parsed.netloc not in ("localhost",):
+        path = f"/{parsed.netloc}{path}"
+    return path
+
+
+def _default_cli_project_folders() -> List[str]:
+    """Return folder paths statically attached to `default-cli-project.json`."""
+    path = _default_cli_project_path()
+    if not path or not os.path.isfile(path):
+        return []
+    data = _read_json_file(path)
+    if not data:
+        return []
+    proj_res = data.get("projectResources")
+    if not isinstance(proj_res, dict):
+        return []
+    resources = proj_res.get("resources")
+    if not isinstance(resources, list):
+        return []
+    folders: List[str] = []
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        uri = str(item.get("folderUri") or "").strip()
+        local_path = _file_uri_to_path(uri)
+        if local_path:
+            folders.append(local_path)
+    return folders
+
+
+def _collect_payload_workspaces(payload: Dict[str, Any]) -> Tuple[List[str], str]:
+    candidates: List[str] = []
+    seen_norm: Set[str] = set()
+
+    def _add(raw_path: Any) -> None:
+        if not isinstance(raw_path, str):
+            return
+        cleaned = raw_path.strip()
+        if not cleaned:
+            return
+        norm = _normalize_compare_path(cleaned)
+        if norm and norm not in seen_norm:
+            seen_norm.add(norm)
+            candidates.append(cleaned)
+
+    ws = payload.get("workspacePaths")
+    if isinstance(ws, list):
+        for entry in ws:
+            _add(entry)
+
+    payload_cwd = str(payload.get("cwd") or "").strip()
+    if not candidates and payload_cwd:
+        _add(payload_cwd)
+
+    return candidates, payload_cwd
+
+
+def _resolve_project_dir(
+    payload: Dict[str, Any], agy_pid: Optional[int] = None
+) -> str:
+    """Resolve the active project directory for a hook payload or CLI invocation.
+
+    In multi-workspace `agy` sessions (such as `--add-dir` or extra folders stored in
+    `default-cli-project.json`), `agy` sorts `WorkspaceInfos` lexicographically and
+    populates `payload["cwd"]` from `workspacePaths[0]`, which can point to a secondary
+    workspace instead of the launched CLI project. Prefer the workspace matching the
+    owning `agy` process's working directory while preserving cross-project `/resume`.
+    """
+    candidates, payload_cwd = _collect_payload_workspaces(payload)
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    pid = agy_pid
+    if pid is None:
+        pid, _ = _find_ancestor_agy_pid()
+    agy_cwd = _get_agy_launch_cwd(pid)
+
+    if candidates:
+        if agy_cwd:
+            for cand in candidates:
+                if _same_path(agy_cwd, cand):
+                    return cand
+
+            best_cand = ""
+            best_depth = -1
+            for cand in candidates:
+                depth = _containment_depth(agy_cwd, cand)
+                if depth is not None and depth > best_depth:
+                    best_depth = depth
+                    best_cand = cand
+            if best_cand:
+                return best_cand
+
+        default_folders = _default_cli_project_folders()
+        if default_folders:
+            specific = [
+                cand
+                for cand in candidates
+                if not any(_same_path(cand, df) for df in default_folders)
+            ]
+            if specific:
+                candidates = specific
+
+        if payload_cwd and any(_same_path(payload_cwd, cand) for cand in candidates):
+            return payload_cwd
+        return candidates[0]
+
+    if agy_cwd:
+        return agy_cwd
+
+    cur_cwd = os.getcwd()
+    plugin_root = os.environ.get("PLUGIN_ROOT", "").strip()
+    if plugin_root and _same_path(cur_cwd, plugin_root):
+        return ""
+    return cur_cwd
+
+
+def _project_name(
+    payload: Dict[str, Any], agy_pid: Optional[int] = None
+) -> str:
+    proj_dir = _resolve_project_dir(payload, agy_pid=agy_pid)
+    if not proj_dir:
+        return "agy"
+    base = os.path.basename(proj_dir.rstrip("/"))
+    return base or proj_dir
 
 
 def _build_stop_notification(
-    payload: Dict[str, Any], cfg: Dict[str, Any]
+    payload: Dict[str, Any], cfg: Dict[str, Any], agy_pid: Optional[int] = None
 ) -> Optional[Tuple[str, str, str]]:
     """Build (subtitle, body, sound_name) for a Stop event, or None if filtered."""
     reason = str(payload.get("terminationReason") or "NO_TOOL_CALL")
@@ -1333,7 +1638,7 @@ def _build_stop_notification(
     ):
         return None
 
-    project = _project_name(payload)
+    project = _project_name(payload, agy_pid=agy_pid)
     took = format_duration(duration_sec)
     zh = cfg["lang"] == "zh"
 
@@ -1394,7 +1699,7 @@ def _build_stop_notification(
 
 
 def _build_question_notification(
-    payload: Dict[str, Any], cfg: Dict[str, Any]
+    payload: Dict[str, Any], cfg: Dict[str, Any], agy_pid: Optional[int] = None
 ) -> Optional[Tuple[str, str, str]]:
     if not cfg["notify_on_question"]:
         return None
@@ -1412,7 +1717,7 @@ def _build_question_notification(
                 question_text = str(first.get("question") or "").strip()
 
     zh = cfg["lang"] == "zh"
-    project = _project_name(payload)
+    project = _project_name(payload, agy_pid=agy_pid)
     status = "等待你的确认" if zh else "waiting for input"
     subtitle = f"{project} · {status}"
     body = clip_text(
@@ -1661,7 +1966,11 @@ def _run_prompt_watcher(
                         continue
 
                     ctx = _read_json_file(_watcher_context_path(agy_pid))
-                    project = str((ctx or {}).get("project") or "").strip() or initial_project or "agy"
+                    project = (
+                        str((ctx or {}).get("project") or "").strip()
+                        or initial_project
+                        or _project_name({}, agy_pid=agy_pid)
+                    )
 
                     notif: Optional[Tuple[str, str, str]] = None
                     if event_kind == "question":
@@ -1776,9 +2085,12 @@ def _run_hook() -> int:
             if cfg["notify_on_permission"] or cfg["notify_on_question"]:
                 agy_pid, is_interactive = _find_ancestor_agy_pid()
                 if is_interactive and agy_pid > 1:
-                    _ensure_prompt_watcher(agy_pid, _project_name(payload))
+                    _ensure_prompt_watcher(
+                        agy_pid, _project_name(payload, agy_pid=agy_pid)
+                    )
             return _emit(response)
 
+        agy_pid = 0
         if event == "Stop":
             reason = str(payload.get("terminationReason") or "NO_TOOL_CALL")
             if reason == "USER_CANCELED":
@@ -1798,10 +2110,11 @@ def _run_hook() -> int:
         if not focus.get("is_interactive", True) or focus.get("focused", False):
             return _emit(response)
 
+        resolved_agy_pid = int((focus.get("host") or {}).get("agy_pid") or 0) or agy_pid
         notif = (
-            _build_stop_notification(payload, cfg)
+            _build_stop_notification(payload, cfg, agy_pid=resolved_agy_pid)
             if event == "Stop"
-            else _build_question_notification(payload, cfg)
+            else _build_question_notification(payload, cfg, agy_pid=resolved_agy_pid)
         )
         if notif is not None:
             subtitle, body, sound = notif
@@ -1920,20 +2233,32 @@ def _run_cli(argv: List[str]) -> int:
             focus_mode=cfg["focus_mode"], include_frontmost=True
         )
         agy_pid = int((state.get("host") or {}).get("agy_pid") or 0)
-        state["prompt_watcher"] = _inspect_prompt_watcher_status(agy_pid)
+        agy_cwd = _get_agy_launch_cwd(agy_pid)
+        if isinstance(state.get("host"), dict):
+            state["host"]["agy_cwd"] = agy_cwd
+            state["host"]["project"] = _project_name({}, agy_pid=agy_pid)
+        watcher_status = _inspect_prompt_watcher_status(agy_pid)
+        ctx = _read_json_file(_watcher_context_path(agy_pid)) if agy_pid > 1 else None
+        if ctx and ctx.get("project"):
+            watcher_status["project"] = str(ctx["project"])
+        state["prompt_watcher"] = watcher_status
         state["config_path"] = _config_path()
         state["config"] = cfg
         print(json.dumps(state, indent=2, ensure_ascii=False))
 
     if args.test:
         is_prompt_test = bool(args.question or args.permission)
+        agy_pid = 0
         if args.respect_focus:
             mode_to_check = cfg["prompt_focus_mode"] if is_prompt_test else cfg["focus_mode"]
             state = inspect_focus_state(focus_mode=mode_to_check)
             if state.get("focused"):
                 print(f"Skipped test notification because CLI is currently focused ({state.get('reason')}).")
                 return 0
-        project = os.path.basename(os.getcwd().rstrip("/")) or "agy"
+            agy_pid = int((state.get("host") or {}).get("agy_pid") or 0)
+        else:
+            agy_pid, _ = _find_ancestor_agy_pid()
+        project = _project_name({}, agy_pid=agy_pid)
         zh = cfg["lang"] == "zh"
         if args.permission:
             subtitle = f"{project} · {'等待权限确认' if zh else 'waiting for permission'}"
