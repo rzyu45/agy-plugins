@@ -21,13 +21,14 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 import unicodedata
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote as _url_quote, unquote, urlparse
 
 OSASCRIPT_LINES = (
     "on run argv",
@@ -172,6 +173,12 @@ CLI_STORE_WORKSPACE_RE = re.compile(
     r"^Initializing CLI store manager for workspace\s+(?P<path>/.*)$"
 )
 LSOF_HEX_ESCAPE_RE = re.compile(r"(?:\\x[0-9a-fA-F]{2})+")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+PBTXT_TITLE_RE = re.compile(r'(?:^|[\s{])title\s*:\s*"((?:\\.|[^"\\])*)"')
+CONV_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+SCRIPT_VERSION = "1.3.0"
+CONV_TITLE_MAX = 60
 
 _PROC_PIDVNODEPATHINFO = 9
 _PROC_VNODEPATHINFO_SIZE = 2352
@@ -200,6 +207,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "notify_on_question": True,
     "notify_on_permission": True,
     "notify_when_bg_running": True,
+    "show_conversation": True,
 }
 
 
@@ -325,6 +333,7 @@ def _normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         "notify_on_question",
         "notify_on_permission",
         "notify_when_bg_running",
+        "show_conversation",
     ):
         if key in raw:
             cfg[key] = _parse_bool(raw[key], DEFAULT_CONFIG[key])
@@ -1122,25 +1131,89 @@ def _inspect_prompt_watcher_status(agy_pid: int) -> Dict[str, Any]:
         "running": alive,
         "agy_pid": agy_pid,
         "watcher_pid": wpid if alive else 0,
+        "watcher_lstart": str(state.get("watcher_lstart") or ""),
+        "script_version": str(state.get("script_version") or ""),
         "log_path": str(state.get("log_path") or ""),
     }
 
 
-def _ensure_prompt_watcher(agy_pid: int, project: str) -> None:
-    if agy_pid <= 1 or not _pid_alive(agy_pid):
+def _write_watcher_context(
+    agy_pid: int,
+    project: str,
+    conv_id: str = "",
+    conversation: str = "",
+    app_data_dir: str = "",
+) -> None:
+    if agy_pid <= 1:
         return
-
+    ctx: Dict[str, Any] = {
+        "project": project,
+        "updated_at": time.time(),
+    }
+    if conv_id:
+        ctx["conversation_id"] = conv_id
+    if conversation:
+        ctx["conversation"] = conversation
+    if app_data_dir:
+        ctx["app_data_dir"] = app_data_dir
     try:
-        _atomic_write_json(
-            _watcher_context_path(agy_pid),
-            {"project": project, "updated_at": time.time()},
-        )
+        _atomic_write_json(_watcher_context_path(agy_pid), ctx)
     except OSError:
         pass
 
+
+def _stop_outdated_watcher(status: Dict[str, Any]) -> bool:
+    """Stop a running prompt watcher started by an older script version.
+
+    Returns True if the old watcher was stopped (or already exited), False if it
+    could not be verified as our watcher process.
+    """
+    wpid = int(status.get("watcher_pid") or 0)
+    rec_lstart = str(status.get("watcher_lstart") or "")
+    if wpid <= 1 or wpid == os.getpid() or not rec_lstart:
+        return False
+    cur_lstart = _process_lstart(wpid)
+    if not cur_lstart or cur_lstart != rec_lstart:
+        return False
+    ps_table = _read_ps_table()
+    entry = ps_table.get(wpid)
+    if not entry or "--watch-prompts" not in entry[2]:
+        return False
+    try:
+        os.kill(wpid, signal.SIGTERM)
+    except OSError:
+        return not _pid_alive(wpid)
+    for _ in range(8):
+        if not _pid_alive(wpid):
+            return True
+        time.sleep(0.05)
+    return not _pid_alive(wpid)
+
+
+def _ensure_prompt_watcher(
+    agy_pid: int,
+    project: str,
+    conv_id: str = "",
+    conversation: str = "",
+    app_data_dir: str = "",
+) -> None:
+    if agy_pid <= 1 or not _pid_alive(agy_pid):
+        return
+
+    _write_watcher_context(
+        agy_pid,
+        project=project,
+        conv_id=conv_id,
+        conversation=conversation,
+        app_data_dir=app_data_dir,
+    )
+
     status = _inspect_prompt_watcher_status(agy_pid)
     if status.get("running"):
-        return
+        if status.get("script_version") == SCRIPT_VERSION:
+            return
+        if not _stop_outdated_watcher(status):
+            return
 
     cmd: List[str] = [
         sys.executable or "/usr/bin/python3",
@@ -1616,6 +1689,302 @@ def _project_name(
     return base or proj_dir
 
 
+def _sanitize_single_line(text: str) -> str:
+    """Strip ANSI escape sequences and control characters, collapsing whitespace."""
+    if not text:
+        return ""
+    plain = ANSI_RE.sub("", text)
+    chars: List[str] = []
+    for ch in plain:
+        code = ord(ch)
+        if ch in ("\r", "\n", "\t"):
+            chars.append(" ")
+        elif code < 32 or 0x7F <= code < 0xA0:
+            continue
+        else:
+            chars.append(ch)
+    return WHITESPACE_RE.sub(" ", "".join(chars)).strip()
+
+
+def _unescape_pbtxt_string(raw: str) -> str:
+    """Decode protobuf text-format string escapes (including octal/hex UTF-8 bytes)."""
+    if "\\" not in raw:
+        return raw
+    out = bytearray()
+    i = 0
+    n = len(raw)
+    simple_escapes = {
+        "a": 0x07,
+        "b": 0x08,
+        "f": 0x0C,
+        "n": 0x0A,
+        "r": 0x0D,
+        "t": 0x09,
+        "v": 0x0B,
+        "\\": 0x5C,
+        '"': 0x22,
+        "'": 0x27,
+        "?": 0x3F,
+    }
+    while i < n:
+        ch = raw[i]
+        if ch != "\\" or i + 1 >= n:
+            out.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        nxt = raw[i + 1]
+        if nxt in simple_escapes:
+            out.append(simple_escapes[nxt])
+            i += 2
+        elif nxt in "01234567":
+            j = i + 1
+            while j < n and j < i + 4 and raw[j] in "01234567":
+                j += 1
+            out.append(int(raw[i + 1 : j], 8) & 0xFF)
+            i = j
+        elif nxt in ("x", "X") and i + 3 < n:
+            hex_part = raw[i + 2 : i + 4]
+            try:
+                out.append(int(hex_part, 16))
+                i += 4
+            except ValueError:
+                out.extend(nxt.encode("utf-8"))
+                i += 2
+        elif nxt == "u" and i + 5 < n:
+            try:
+                out.extend(chr(int(raw[i + 2 : i + 6], 16)).encode("utf-8"))
+                i += 6
+            except ValueError:
+                out.extend(nxt.encode("utf-8"))
+                i += 2
+        elif nxt == "U" and i + 9 < n:
+            try:
+                out.extend(chr(int(raw[i + 2 : i + 10], 16)).encode("utf-8"))
+                i += 10
+            except ValueError:
+                out.extend(nxt.encode("utf-8"))
+                i += 2
+        else:
+            out.extend(nxt.encode("utf-8"))
+            i += 2
+    return out.decode("utf-8", errors="replace")
+
+
+def _extract_conversation_id(payload: Dict[str, Any]) -> str:
+    for key in ("conversationId", "conversation_id", "sessionId", "session_id"):
+        val = str(payload.get(key) or "").strip()
+        if val:
+            return val
+    artifact_dir = str(payload.get("artifactDirectoryPath") or "").strip().rstrip("/")
+    if artifact_dir:
+        parent = os.path.dirname(artifact_dir)
+        if os.path.basename(parent) == "brain":
+            cand = os.path.basename(artifact_dir)
+            if cand and CONV_ID_SAFE_RE.match(cand):
+                return cand
+    return ""
+
+
+def _resolve_app_data_dir(payload: Dict[str, Any], explicit: str = "") -> str:
+    if explicit:
+        return os.path.expanduser(explicit)
+
+    artifact_dir = str(payload.get("artifactDirectoryPath") or "").strip().rstrip("/")
+    if artifact_dir:
+        brain_dir = os.path.dirname(artifact_dir)
+        if os.path.basename(brain_dir) == "brain":
+            app_dir = os.path.dirname(brain_dir)
+            if app_dir:
+                return app_dir
+
+    transcript_path = str(payload.get("transcriptPath") or "").strip()
+    if transcript_path:
+        cur = os.path.dirname(transcript_path)
+        for _ in range(5):
+            if os.path.basename(cur) == "brain":
+                app_dir = os.path.dirname(cur)
+                if app_dir:
+                    return app_dir
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+
+    for env_key in ("ANTIGRAVITY_APP_DATA_DIR", "JETSKI_APP_DATA_DIR"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            return os.path.expanduser(raw)
+    return os.path.expanduser("~/.gemini/antigravity-cli")
+
+
+def _summaries_db_path(app_data_dir: str) -> str:
+    if "DONE_NOTIFY_SUMMARIES_DB" in os.environ:
+        return os.environ.get("DONE_NOTIFY_SUMMARIES_DB", "").strip()
+    return os.path.join(app_data_dir, "conversation_summaries.db")
+
+
+def _annotations_pbtxt_path(app_data_dir: str, conv_id: str) -> str:
+    if not conv_id or not CONV_ID_SAFE_RE.match(conv_id):
+        return ""
+    if "DONE_NOTIFY_ANNOTATIONS_DIR" in os.environ:
+        ann_dir = os.environ.get("DONE_NOTIFY_ANNOTATIONS_DIR", "").strip()
+        return os.path.join(ann_dir, f"{conv_id}.pbtxt") if ann_dir else ""
+    return os.path.join(app_data_dir, "annotations", f"{conv_id}.pbtxt")
+
+
+def _metadata_cache_path(app_data_dir: str) -> str:
+    if "DONE_NOTIFY_METADATA_PATH" in os.environ:
+        return os.environ.get("DONE_NOTIFY_METADATA_PATH", "").strip()
+    return os.path.join(app_data_dir, "cache", "conversation_metadata.json")
+
+
+def _query_summaries_db_title(db_path: str, conv_id: str) -> str:
+    """Read live conversation title from agy's SQLite summaries store."""
+    if not db_path or not conv_id or not os.path.isfile(db_path):
+        return ""
+    encoded = _url_quote(os.path.abspath(db_path), safe="/:")
+    for query_suffix in ("mode=ro", "immutable=1"):
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(
+                f"file:{encoded}?{query_suffix}",
+                uri=True,
+                timeout=0.15,
+            )
+            row = conn.execute(
+                "SELECT title FROM conversation_summaries WHERE conversation_id = ? LIMIT 1",
+                (conv_id,),
+            ).fetchone()
+            if row and isinstance(row[0], str):
+                cleaned = _sanitize_single_line(row[0])
+                if cleaned:
+                    return cleaned
+            row_fts = conn.execute(
+                "SELECT title FROM conversations_fts WHERE chunk_index = -1 AND conversation_id = ? LIMIT 1",
+                (conv_id,),
+            ).fetchone()
+            if row_fts and isinstance(row_fts[0], str):
+                cleaned = _sanitize_single_line(row_fts[0])
+                if cleaned:
+                    return cleaned
+            return ""
+        except sqlite3.Error:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+    return ""
+
+
+def _read_annotation_title(pbtxt_path: str) -> str:
+    """Read live conversation title from `annotations/<conv_id>.pbtxt`."""
+    if not pbtxt_path or not os.path.isfile(pbtxt_path):
+        return ""
+    try:
+        with open(pbtxt_path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read(16384)
+    except OSError:
+        return ""
+    match = PBTXT_TITLE_RE.search(raw)
+    if not match:
+        return ""
+    return _sanitize_single_line(_unescape_pbtxt_string(match.group(1)))
+
+
+def _read_metadata_cache_title(meta_path: str, conv_id: str) -> str:
+    if not meta_path or not conv_id or not os.path.isfile(meta_path):
+        return ""
+    meta = _read_json_file(meta_path)
+    if not meta:
+        return ""
+    convs = meta.get("conversations")
+    if not isinstance(convs, dict):
+        return ""
+    entry = convs.get(conv_id)
+    if not isinstance(entry, dict):
+        return ""
+    summary = entry.get("summary")
+    if not isinstance(summary, dict):
+        return ""
+    raw_title = summary.get("Title") or summary.get("title")
+    if isinstance(raw_title, str):
+        return _sanitize_single_line(raw_title)
+    return ""
+
+
+def _conversation_title(payload: Dict[str, Any], app_data_dir: str = "") -> str:
+    """Resolve the active conversation name from hook payload or agy's local stores."""
+    for key in (
+        "conversationTitle",
+        "conversationName",
+        "sessionName",
+        "conversation_title",
+        "conversation_name",
+        "session_name",
+    ):
+        val = payload.get(key)
+        if isinstance(val, str):
+            cleaned = _sanitize_single_line(val)
+            if cleaned:
+                return cleaned
+
+    conv = payload.get("conversation")
+    if isinstance(conv, dict):
+        for key in ("title", "name"):
+            val = conv.get(key)
+            if isinstance(val, str):
+                cleaned = _sanitize_single_line(val)
+                if cleaned:
+                    return cleaned
+
+    conv_id = _extract_conversation_id(payload)
+    if not conv_id:
+        return ""
+
+    data_dir = _resolve_app_data_dir(payload, explicit=app_data_dir)
+    db_title = _query_summaries_db_title(_summaries_db_path(data_dir), conv_id)
+    if db_title:
+        return db_title
+
+    ann_title = _read_annotation_title(_annotations_pbtxt_path(data_dir, conv_id))
+    if ann_title:
+        return ann_title
+
+    return _read_metadata_cache_title(_metadata_cache_path(data_dir), conv_id)
+
+
+def _format_body_with_conversation(
+    body: str, conversation: str, cfg: Dict[str, Any]
+) -> str:
+    """Prepend `[<conversation>]` on its own leading line when available and enabled."""
+    if not cfg.get("show_conversation", True):
+        return clip_text(body, cfg["body_max"])
+    clean_conv = _sanitize_single_line(conversation)
+    if not clean_conv:
+        return clip_text(body, cfg["body_max"])
+    clipped_conv = clip_text(clean_conv, CONV_TITLE_MAX)
+    prefix = f"[{clipped_conv}]\n"
+    rem_budget = max(40, cfg["body_max"] - len(prefix))
+    clipped_body = clip_text(body, rem_budget)
+    return f"{prefix}{clipped_body}" if clipped_body else f"[{clipped_conv}]"
+
+
+def _resolve_context_conversation(ctx: Optional[Dict[str, Any]]) -> str:
+    """Resolve live conversation title from a watcher context dict."""
+    if not isinstance(ctx, dict):
+        return ""
+    conv_id = str(ctx.get("conversation_id") or "").strip()
+    app_data_dir = str(ctx.get("app_data_dir") or "").strip()
+    if conv_id:
+        live = _conversation_title({"conversationId": conv_id}, app_data_dir=app_data_dir)
+        if live:
+            return live
+    return _sanitize_single_line(str(ctx.get("conversation") or ""))
+
+
 def _build_stop_notification(
     payload: Dict[str, Any], cfg: Dict[str, Any], agy_pid: Optional[int] = None
 ) -> Optional[Tuple[str, str, str]]:
@@ -1639,6 +2008,7 @@ def _build_stop_notification(
         return None
 
     project = _project_name(payload, agy_pid=agy_pid)
+    conversation = _conversation_title(payload)
     took = format_duration(duration_sec)
     zh = cfg["lang"] == "zh"
 
@@ -1682,19 +2052,20 @@ def _build_stop_notification(
 
     subtitle = f"{project} · {status}"
 
-    cleaned_answer = clip_text(plain_text(answer_md), cfg["body_max"])
+    cleaned_answer = plain_text(answer_md)
     error_raw = str(payload.get("error") or "").strip()
-    cleaned_error = clip_text(plain_text(error_raw), cfg["body_max"])
+    cleaned_error = plain_text(error_raw)
 
     if is_failure:
-        body = cleaned_error or cleaned_answer or (
+        raw_body = cleaned_error or cleaned_answer or (
             "本轮执行异常中止。" if zh else "The turn ended with an error."
         )
         sound = cfg["error_sound"]
     else:
-        body = cleaned_answer or ("回答完毕。" if zh else "Response finished.")
+        raw_body = cleaned_answer or ("回答完毕。" if zh else "Response finished.")
         sound = cfg["sound"]
 
+    body = _format_body_with_conversation(raw_body, conversation, cfg)
     return subtitle, body, sound
 
 
@@ -1718,17 +2089,22 @@ def _build_question_notification(
 
     zh = cfg["lang"] == "zh"
     project = _project_name(payload, agy_pid=agy_pid)
+    conversation = _conversation_title(payload)
     status = "等待你的确认" if zh else "waiting for input"
     subtitle = f"{project} · {status}"
-    body = clip_text(
-        plain_text(question_text) or ("需要你选择一项后继续执行。" if zh else "Waiting for your answer to continue."),
-        cfg["body_max"],
+    raw_body = plain_text(question_text) or (
+        "需要你选择一项后继续执行。" if zh else "Waiting for your answer to continue."
     )
+    body = _format_body_with_conversation(raw_body, conversation, cfg)
     return subtitle, body, cfg["prompt_sound"]
 
 
 def _build_permission_notification(
-    project: str, label: str, cfg: Dict[str, Any], is_subagent: bool = False
+    project: str,
+    label: str,
+    cfg: Dict[str, Any],
+    is_subagent: bool = False,
+    conversation: str = "",
 ) -> Optional[Tuple[str, str, str]]:
     if not cfg["notify_on_permission"]:
         return None
@@ -1754,7 +2130,7 @@ def _build_permission_notification(
                 clean_label, f"Action '{clean_label}' is waiting for your permission."
             )
 
-    body = clip_text(raw_body, cfg["body_max"])
+    body = _format_body_with_conversation(raw_body, conversation, cfg)
     return subtitle, body, cfg["prompt_sound"]
 
 
@@ -1862,6 +2238,7 @@ def _run_prompt_watcher(
             {
                 "watcher_pid": os.getpid(),
                 "watcher_lstart": watcher_lstart,
+                "script_version": SCRIPT_VERSION,
                 "agy_pid": agy_pid,
                 "agy_lstart": agy_lstart,
                 "log_path": log_path,
@@ -1971,6 +2348,7 @@ def _run_prompt_watcher(
                         or initial_project
                         or _project_name({}, agy_pid=agy_pid)
                     )
+                    conversation = _resolve_context_conversation(ctx)
 
                     notif: Optional[Tuple[str, str, str]] = None
                     if event_kind == "question":
@@ -1978,19 +2356,20 @@ def _run_prompt_watcher(
                             continue
                         zh = cfg["lang"] == "zh"
                         subtitle = f"{project} · {'等待你的确认' if zh else 'waiting for input'}"
-                        body = (
+                        raw_body = (
                             "需要你回答问题后继续执行。"
                             if zh
                             else "Waiting for your answer to continue."
                         )
+                        body = _format_body_with_conversation(raw_body, conversation, cfg)
                         notif = (subtitle, body, cfg["prompt_sound"])
                     elif event_kind == "subagent":
                         notif = _build_permission_notification(
-                            project, "", cfg, is_subagent=True
+                            project, "", cfg, is_subagent=True, conversation=conversation
                         )
                     else:
                         notif = _build_permission_notification(
-                            project, label, cfg, is_subagent=False
+                            project, label, cfg, is_subagent=False, conversation=conversation
                         )
 
                     if notif is None:
@@ -2086,7 +2465,11 @@ def _run_hook() -> int:
                 agy_pid, is_interactive = _find_ancestor_agy_pid()
                 if is_interactive and agy_pid > 1:
                     _ensure_prompt_watcher(
-                        agy_pid, _project_name(payload, agy_pid=agy_pid)
+                        agy_pid,
+                        _project_name(payload, agy_pid=agy_pid),
+                        conv_id=_extract_conversation_id(payload),
+                        conversation=_conversation_title(payload),
+                        app_data_dir=_resolve_app_data_dir(payload),
                     )
             return _emit(response)
 
@@ -2111,6 +2494,14 @@ def _run_hook() -> int:
             return _emit(response)
 
         resolved_agy_pid = int((focus.get("host") or {}).get("agy_pid") or 0) or agy_pid
+        if resolved_agy_pid > 1 and _pid_alive(resolved_agy_pid):
+            _write_watcher_context(
+                resolved_agy_pid,
+                project=_project_name(payload, agy_pid=resolved_agy_pid),
+                conv_id=_extract_conversation_id(payload),
+                conversation=_conversation_title(payload),
+                app_data_dir=_resolve_app_data_dir(payload),
+            )
         notif = (
             _build_stop_notification(payload, cfg, agy_pid=resolved_agy_pid)
             if event == "Stop"
@@ -2234,13 +2625,20 @@ def _run_cli(argv: List[str]) -> int:
         )
         agy_pid = int((state.get("host") or {}).get("agy_pid") or 0)
         agy_cwd = _get_agy_launch_cwd(agy_pid)
+        ctx = _read_json_file(_watcher_context_path(agy_pid)) if agy_pid > 1 else None
+        live_conv = _resolve_context_conversation(ctx)
         if isinstance(state.get("host"), dict):
             state["host"]["agy_cwd"] = agy_cwd
             state["host"]["project"] = _project_name({}, agy_pid=agy_pid)
+            state["host"]["conversation"] = live_conv
         watcher_status = _inspect_prompt_watcher_status(agy_pid)
-        ctx = _read_json_file(_watcher_context_path(agy_pid)) if agy_pid > 1 else None
-        if ctx and ctx.get("project"):
-            watcher_status["project"] = str(ctx["project"])
+        if ctx:
+            if ctx.get("project"):
+                watcher_status["project"] = str(ctx["project"])
+            if ctx.get("conversation_id"):
+                watcher_status["conversation_id"] = str(ctx["conversation_id"])
+            if live_conv:
+                watcher_status["conversation"] = live_conv
         state["prompt_watcher"] = watcher_status
         state["config_path"] = _config_path()
         state["config"] = cfg
@@ -2259,10 +2657,14 @@ def _run_cli(argv: List[str]) -> int:
         else:
             agy_pid, _ = _find_ancestor_agy_pid()
         project = _project_name({}, agy_pid=agy_pid)
+        ctx = _read_json_file(_watcher_context_path(agy_pid)) if agy_pid > 1 else None
         zh = cfg["lang"] == "zh"
+        conversation = _resolve_context_conversation(ctx) or (
+            "测试会话" if zh else "Test Session"
+        )
         if args.permission:
             subtitle = f"{project} · {'等待权限确认' if zh else 'waiting for permission'}"
-            body = (
+            raw_body = (
                 "测试通知：终端命令执行需要你确认权限。"
                 if zh
                 else "Test notification: A command is waiting for your permission."
@@ -2270,7 +2672,7 @@ def _run_cli(argv: List[str]) -> int:
             sound = cfg["prompt_sound"]
         elif args.question:
             subtitle = f"{project} · {'等待你的确认' if zh else 'waiting for input'}"
-            body = (
+            raw_body = (
                 "测试通知：需要你回答问题后继续执行。"
                 if zh
                 else "Test notification: Waiting for your answer to continue."
@@ -2278,12 +2680,13 @@ def _run_cli(argv: List[str]) -> int:
             sound = cfg["prompt_sound"]
         elif args.error:
             subtitle = f"{project} · {'任务失败（3s）' if zh else 'turn failed after 3s'}"
-            body = "测试通知：模拟任务失败提醒。" if zh else "Test notification: simulated failed turn alert."
+            raw_body = "测试通知：模拟任务失败提醒。" if zh else "Test notification: simulated failed turn alert."
             sound = cfg["error_sound"]
         else:
             subtitle = f"{project} · {'已完成（3s）' if zh else 'done in 3s'}"
-            body = "测试通知：回答完毕提醒已正常工作。" if zh else "Test notification: Done Notify banner and sound are active."
+            raw_body = "测试通知：回答完毕提醒已正常工作。" if zh else "Test notification: Done Notify banner and sound are active."
             sound = cfg["sound"]
+        body = _format_body_with_conversation(raw_body, conversation, cfg)
         ok, err = send_macos_notification(
             title=cfg["title"],
             subtitle=subtitle,

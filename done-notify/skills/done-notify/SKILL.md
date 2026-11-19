@@ -30,6 +30,7 @@ This skill bundles [done-notify.py](./scripts/done-notify.py), a zero-dependency
    - `python3 ./scripts/done-notify.py --set focus_mode=always --set prompt_focus_mode=always`
    - Optional focus suppression when viewing the CLI: `python3 ./scripts/done-notify.py --set focus_mode=tab`
    - `python3 ./scripts/done-notify.py --set notify_on_question=true --set notify_on_permission=true`
+   - `python3 ./scripts/done-notify.py --set show_conversation=true`
    - `python3 ./scripts/done-notify.py --set min_duration_sec=5`
    - `python3 ./scripts/done-notify.py --reset-config`
 4. See [README.md](./references/README.md) for full behavior and troubleshooting details.
