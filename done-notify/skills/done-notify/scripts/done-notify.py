@@ -3,9 +3,9 @@
 
 Modeled on Claude Code's local `done-notify` plugin:
 - Plays a macOS system sound + Notification Center banner when a turn finishes,
-  fails, or completes a background task (`Stop`), regardless of focus by default
-  (`focus_mode="always"`), with optional terminal/tab focus suppression
-  (`focus_mode="tab"` or `"app"`).
+  fails, completes a background task, or receives a `/swarm` worker `[done]`
+  report (`Stop`), regardless of focus by default (`focus_mode="always"`), with
+  optional terminal/tab focus suppression (`focus_mode="tab"` or `"app"`).
 - Plays a prompt sound + banner when `agy` pauses for user input (`ask_question`)
   or waits for user permission approval (`Surfacing tool confirmation` / queued
   subagent approval).
@@ -176,9 +176,20 @@ LSOF_HEX_ESCAPE_RE = re.compile(r"(?:\\x[0-9a-fA-F]{2})+")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 PBTXT_TITLE_RE = re.compile(r'(?:^|[\s{])title\s*:\s*"((?:\\.|[^"\\])*)"')
 CONV_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SWARM_WAIT_RESULT_RE = re.compile(r"(?:^|\n)Waiting for a message\b")
+TOOL_OUTPUT_FILE_RE = re.compile(r"file://(/[^\s\"'<>]+?/output\.txt)\b")
+SWARM_MENTION_TOKEN_RE = re.compile(r"@([A-Za-z0-9_-]+)")
+SWARM_DONE_LEAD_RE = re.compile(
+    r"^(?P<lead>(?:@[A-Za-z0-9_-]+[:,，]?\s*)*)(?:\[done\][:,：]?\s*)+(?P<after>(?:@[A-Za-z0-9_-]+[:,，]?\s*)*)",
+    re.IGNORECASE,
+)
+SWARM_MSG_FALLBACK_RE = re.compile(
+    r'"agent"\s*:\s*"(?P<agent>(?:\\.|[^"\\])+)"\s*,\s*"text"\s*:\s*"(?P<text>(?:\\.|[^"\\])*)'
+)
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 CONV_TITLE_MAX = 60
+TOOL_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 
 _PROC_PIDVNODEPATHINFO = 9
 _PROC_VNODEPATHINFO_SIZE = 2352
@@ -207,6 +218,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "notify_on_question": True,
     "notify_on_permission": True,
     "notify_when_bg_running": True,
+    "notify_on_swarm_done": True,
     "show_conversation": True,
 }
 
@@ -333,6 +345,7 @@ def _normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         "notify_on_question",
         "notify_on_permission",
         "notify_when_bg_running",
+        "notify_on_swarm_done",
         "show_conversation",
     ):
         if key in raw:
@@ -1341,8 +1354,202 @@ def _resolve_full_step_content(
     return None
 
 
-def _extract_turn_details(payload: Dict[str, Any]) -> Tuple[Optional[float], bool, str]:
-    """Return (duration_sec, is_background_wakeup, model_answer_markdown)."""
+def _is_swarm_wait_result_step(step: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(step, dict):
+        return False
+    if str(step.get("type") or "") != "GENERIC":
+        return False
+    content = step.get("content")
+    return isinstance(content, str) and bool(SWARM_WAIT_RESULT_RE.search(content))
+
+
+def _planner_called_swarm_wait(step: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(step, dict):
+        return False
+    if str(step.get("type") or "") != "PLANNER_RESPONSE":
+        return False
+    tool_calls = step.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False
+    for tc in tool_calls:
+        if isinstance(tc, dict) and str(tc.get("name") or "") == "swarm_wait":
+            return True
+    return False
+
+
+def _step_ended_prior_turn(step: Optional[Dict[str, Any]]) -> bool:
+    if step is None:
+        return True
+    if not isinstance(step, dict):
+        return False
+    if str(step.get("type") or "") == "PLANNER_RESPONSE" and not step.get("tool_calls"):
+        return True
+    if _is_swarm_wait_result_step(step) or _planner_called_swarm_wait(step):
+        return True
+    return False
+
+
+def _read_tool_output_file(
+    raw_content: str, transcript_path: str, step_index: Any
+) -> Optional[str]:
+    candidates: List[str] = []
+    match = TOOL_OUTPUT_FILE_RE.search(raw_content)
+    if match:
+        candidates.append(unquote(match.group(1)))
+    if (
+        transcript_path
+        and step_index is not None
+        and re.fullmatch(r"\d+", str(step_index))
+        and "output was truncated" in raw_content.lower()
+    ):
+        sysgen_dir = os.path.dirname(os.path.dirname(transcript_path))
+        sibling = os.path.join(sysgen_dir, "steps", str(step_index), "output.txt")
+        if sibling not in candidates:
+            candidates.append(sibling)
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            if os.path.getsize(path) > TOOL_OUTPUT_MAX_BYTES:
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            continue
+    return None
+
+
+def _extract_board_json_messages(raw_text: str) -> Optional[List[Dict[str, Any]]]:
+    """Parse the `messages` list from a `read_board` tool output string, or None."""
+    if not raw_text or '"messages"' not in raw_text:
+        return None
+    decoder = json.JSONDecoder()
+    search_from = 0
+    while True:
+        idx = raw_text.find('{"messages"', search_from)
+        if idx < 0:
+            m = re.search(r'\{\s*"messages"\s*:', raw_text[search_from:])
+            if not m:
+                break
+            idx = search_from + m.start()
+        try:
+            obj, _ = decoder.raw_decode(raw_text, idx)
+            if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
+                return [item for item in obj["messages"] if isinstance(item, dict)]
+        except ValueError:
+            pass
+        search_from = idx + 1
+    return None
+
+
+def _parse_board_messages_from_step(
+    step: Dict[str, Any], transcript_path: str, line_idx: int
+) -> List[Dict[str, Any]]:
+    if str(step.get("type") or "") != "GENERIC":
+        return []
+    raw_content = step.get("content")
+    if not isinstance(raw_content, str) or not raw_content:
+        return []
+    if '"messages"' not in raw_content and "output.txt" not in raw_content:
+        return []
+
+    step_index = step.get("step_index")
+    full_from_file = _read_tool_output_file(raw_content, transcript_path, step_index)
+    if full_from_file:
+        parsed = _extract_board_json_messages(full_from_file)
+        if parsed is not None:
+            return parsed
+
+    truncated = step.get("truncated_fields") or []
+    if "content" not in truncated:
+        parsed = _extract_board_json_messages(raw_content)
+        if parsed is not None:
+            return parsed
+
+    resolved_content = raw_content
+    if "content" in truncated and transcript_path:
+        full_content = _resolve_full_step_content(transcript_path, line_idx, step_index)
+        if full_content:
+            resolved_content = full_content
+            from_resolved_file = _read_tool_output_file(
+                resolved_content, transcript_path, step_index
+            )
+            if from_resolved_file:
+                parsed = _extract_board_json_messages(from_resolved_file)
+                if parsed is not None:
+                    return parsed
+            parsed = _extract_board_json_messages(resolved_content)
+            if parsed is not None:
+                return parsed
+
+    fallback_msgs: List[Dict[str, Any]] = []
+    for match in SWARM_MSG_FALLBACK_RE.finditer(resolved_content):
+        agent = _unescape_go_quoted(match.group("agent")).strip()
+        text = _unescape_go_quoted(match.group("text"))
+        if agent:
+            fallback_msgs.append({"agent": agent, "text": text})
+    return fallback_msgs
+
+
+def _extract_swarm_turn_info(
+    turn_entries: List[Tuple[int, Dict[str, Any]]], transcript_path: str
+) -> Dict[str, Any]:
+    """Inspect current-turn entries for `swarm_wait` parking and worker `[done]` posts."""
+    last_planner: Optional[Dict[str, Any]] = None
+    has_wait_result = False
+    for _line_idx, step in reversed(turn_entries):
+        step_type = str(step.get("type") or "")
+        if step_type in MID_TURN_STEP_TYPES:
+            continue
+        if not has_wait_result and _is_swarm_wait_result_step(step):
+            has_wait_result = True
+        if step_type == "PLANNER_RESPONSE":
+            last_planner = step
+            break
+
+    is_swarm_wait = has_wait_result or _planner_called_swarm_wait(last_planner)
+    done_workers: List[Tuple[str, str]] = []
+    if not is_swarm_wait:
+        return {"is_swarm_wait": False, "done_workers": done_workers}
+
+    done_by_agent: Dict[str, str] = {}
+    done_order: List[str] = []
+    for line_idx, step in turn_entries:
+        for msg in _parse_board_messages_from_step(step, transcript_path, line_idx):
+            agent = str(msg.get("agent") or "").strip()
+            if not agent or agent.lower() == "coordinator":
+                continue
+            if str(msg.get("kind") or "").strip().lower() == "brief":
+                continue
+            text = str(msg.get("text") or "").strip()
+            if not text:
+                continue
+            lead_match = SWARM_DONE_LEAD_RE.match(text)
+            if not lead_match:
+                continue
+            mentions = {
+                m.lower()
+                for m in SWARM_MENTION_TOKEN_RE.findall(
+                    (lead_match.group("lead") or "") + " " + (lead_match.group("after") or "")
+                )
+            }
+            if mentions and "coordinator" not in mentions and "all" not in mentions:
+                continue
+            summary = text[lead_match.end():].strip()
+            if agent not in done_by_agent:
+                done_order.append(agent)
+                done_by_agent[agent] = summary
+            elif summary:
+                done_by_agent[agent] = summary
+
+    done_workers = [(agent, done_by_agent[agent]) for agent in done_order]
+    return {"is_swarm_wait": True, "done_workers": done_workers}
+
+
+def _extract_turn_details(
+    payload: Dict[str, Any],
+) -> Tuple[Optional[float], bool, str, Dict[str, Any]]:
+    """Return (duration_sec, is_background_wakeup, model_answer_markdown, swarm_info)."""
     transcript_path = payload.get("transcriptPath") or ""
     artifact_dir = payload.get("artifactDirectoryPath") or ""
     if (not transcript_path or not os.path.isfile(transcript_path)) and artifact_dir:
@@ -1357,11 +1564,26 @@ def _extract_turn_details(payload: Dict[str, Any]) -> Tuple[Optional[float], boo
     duration_sec: Optional[float] = None
     is_bg_wakeup = False
     earliest_model_ts: Optional[float] = None
+    turn_entries: List[Tuple[int, Dict[str, Any]]] = []
+    seen_turn_work = False
 
     for pos in range(len(entries) - 1, -1, -1):
         line_idx, step = entries[pos]
         source = str(step.get("source") or "")
         step_type = str(step.get("type") or "")
+        step_ts = _parse_iso_epoch(str(step.get("created_at") or ""))
+
+        if step_type in ("USER_INPUT", "PLAN_INPUT"):
+            if step_ts is not None:
+                duration_sec = max(0.0, time.time() - step_ts)
+            is_bg_wakeup = source != "USER_EXPLICIT"
+            break
+
+        if seen_turn_work and (
+            _is_swarm_wait_result_step(step)
+            or (step_type == "PLANNER_RESPONSE" and not step.get("tool_calls"))
+        ):
+            break
 
         if not answer_md and step_type == "PLANNER_RESPONSE":
             content = step.get("content")
@@ -1375,28 +1597,18 @@ def _extract_turn_details(payload: Dict[str, Any]) -> Tuple[Optional[float], boo
                         content = full_content
                 answer_md = content.strip()
 
-        step_ts = _parse_iso_epoch(str(step.get("created_at") or ""))
-
-        if step_type in ("USER_INPUT", "PLAN_INPUT"):
-            if step_ts is not None:
-                duration_sec = max(0.0, time.time() - step_ts)
-            is_bg_wakeup = source != "USER_EXPLICIT"
-            break
+        turn_entries.append((line_idx, step))
 
         if source == "MODEL" or step_type in MID_TURN_STEP_TYPES:
-            if source == "MODEL" and step_ts is not None:
-                earliest_model_ts = step_ts
+            if source == "MODEL":
+                if step_ts is not None:
+                    earliest_model_ts = step_ts
+                if step_type not in MID_TURN_STEP_TYPES:
+                    seen_turn_work = True
             continue
 
         prev_step = entries[pos - 1][1] if pos > 0 else None
-        prev_ended_turn = (
-            prev_step is None
-            or (
-                str(prev_step.get("type") or "") == "PLANNER_RESPONSE"
-                and not prev_step.get("tool_calls")
-            )
-        )
-        if prev_ended_turn:
+        if _step_ended_prior_turn(prev_step):
             if step_ts is not None:
                 duration_sec = max(0.0, time.time() - step_ts)
             is_bg_wakeup = True
@@ -1405,7 +1617,9 @@ def _extract_turn_details(payload: Dict[str, Any]) -> Tuple[Optional[float], boo
     if duration_sec is None and earliest_model_ts is not None:
         duration_sec = max(0.0, time.time() - earliest_model_ts)
 
-    return duration_sec, is_bg_wakeup, answer_md
+    turn_entries.reverse()
+    swarm_info = _extract_swarm_turn_info(turn_entries, transcript_path)
+    return duration_sec, is_bg_wakeup, answer_md, swarm_info
 
 
 def _normalize_compare_path(path: str) -> str:
@@ -1998,7 +2212,57 @@ def _build_stop_notification(
     if not is_failure and not fully_idle and not cfg["notify_when_bg_running"]:
         return None
 
-    duration_sec, is_bg_wakeup, answer_md = _extract_turn_details(payload)
+    error_raw = str(payload.get("error") or "").strip()
+    cleaned_error = plain_text(error_raw)
+
+    duration_sec, is_bg_wakeup, answer_md, swarm_info = _extract_turn_details(payload)
+    cleaned_answer = plain_text(answer_md)
+
+    project = _project_name(payload, agy_pid=agy_pid)
+    conversation = _conversation_title(payload)
+    zh = cfg["lang"] == "zh"
+
+    # `/swarm` coordinator turns end with `swarm_wait` via a terminal custom hook
+    # (`TERMINAL_CUSTOM_HOOK` with no error). Treat that as a normal park, not an error.
+    if reason == "TERMINAL_CUSTOM_HOOK" and not cleaned_error and swarm_info.get("is_swarm_wait"):
+        done_workers = swarm_info.get("done_workers") or []
+        if done_workers:
+            if not cfg.get("notify_on_swarm_done", True):
+                return None
+            if len(done_workers) == 1:
+                agent, summary = done_workers[0]
+                status = f"@{agent} 已完成" if zh else f"@{agent} done"
+                cleaned_summary = plain_text(summary)
+                raw_body = cleaned_summary or (
+                    f"@{agent} 已完成任务。" if zh else f"@{agent} finished its task."
+                )
+            else:
+                count = len(done_workers)
+                status = f"{count}个子代理已完成" if zh else f"{count} workers done"
+                names = ("、" if zh else ", ").join(f"@{agent}" for agent, _ in done_workers)
+                latest_summary = ""
+                for _agent, summary in reversed(done_workers):
+                    cleaned_summary = plain_text(summary)
+                    if cleaned_summary:
+                        latest_summary = cleaned_summary
+                        break
+                if latest_summary:
+                    raw_body = f"{names}：{latest_summary}" if zh else f"{names}: {latest_summary}"
+                else:
+                    raw_body = (
+                        f"{names} 已完成任务。" if zh else f"{names} finished their tasks."
+                    )
+            subtitle = f"{project} · {status}"
+            body = _format_body_with_conversation(raw_body, conversation, cfg)
+            return subtitle, body, cfg["sound"]
+
+        if not cleaned_answer:
+            return None
+
+        is_failure = False
+        if not fully_idle and not cfg["notify_when_bg_running"]:
+            return None
+
     if (
         not is_failure
         and cfg["min_duration_sec"] > 0
@@ -2007,10 +2271,7 @@ def _build_stop_notification(
     ):
         return None
 
-    project = _project_name(payload, agy_pid=agy_pid)
-    conversation = _conversation_title(payload)
     took = format_duration(duration_sec)
-    zh = cfg["lang"] == "zh"
 
     if is_failure:
         if reason == "MAX_TOKEN_BUDGET_EXCEEDED":
@@ -2051,10 +2312,6 @@ def _build_stop_notification(
             )
 
     subtitle = f"{project} · {status}"
-
-    cleaned_answer = plain_text(answer_md)
-    error_raw = str(payload.get("error") or "").strip()
-    cleaned_error = plain_text(error_raw)
 
     if is_failure:
         raw_body = cleaned_error or cleaned_answer or (
@@ -2559,6 +2816,11 @@ def _run_cli(argv: List[str]) -> int:
         help="With --test, send a permission-prompt notification using prompt_sound.",
     )
     parser.add_argument(
+        "--swarm-done",
+        action="store_true",
+        help="With --test, send a /swarm worker [done] completion notification using sound.",
+    )
+    parser.add_argument(
         "--respect-focus",
         action="store_true",
         help="With --test, suppress the test banner if the current CLI is focused.",
@@ -2678,6 +2940,14 @@ def _run_cli(argv: List[str]) -> int:
                 else "Test notification: Waiting for your answer to continue."
             )
             sound = cfg["prompt_sound"]
+        elif args.swarm_done:
+            subtitle = f"{project} · {'@worker-1 已完成' if zh else '@worker-1 done'}"
+            raw_body = (
+                "测试通知：子代理已完成分配任务并回报汇总结果。"
+                if zh
+                else "Test notification: swarm worker completed its assigned task and posted [done]."
+            )
+            sound = cfg["sound"]
         elif args.error:
             subtitle = f"{project} · {'任务失败（3s）' if zh else 'turn failed after 3s'}"
             raw_body = "测试通知：模拟任务失败提醒。" if zh else "Test notification: simulated failed turn alert."

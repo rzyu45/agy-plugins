@@ -2,8 +2,8 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "done-notify",
   "displayName": "Done Notify",
-  "version": "1.3.0",
-  "description": "macOS Notification Center banner with sound when an Antigravity CLI turn finishes, fails, asks a question, or waits for user permission, with optional terminal/tab focus filtering.",
+  "version": "1.4.0",
+  "description": "macOS Notification Center banner with sound when an Antigravity CLI turn finishes, fails, receives a /swarm worker [done] report, asks a question, or waits for user permission, with optional terminal/tab focus filtering.",
   "author": {
     "name": "Ruizhi Yu",
     "url": "https://github.com/rzyu45"

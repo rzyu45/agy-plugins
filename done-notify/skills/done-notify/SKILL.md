@@ -2,11 +2,11 @@
 name: done-notify
 description: >-
   macOS Notification Center banner and sound alert for Antigravity CLI (agy)
-  when a turn finishes, fails, asks a question (ask_question), or waits on a
-  tool/subagent permission prompt. Alerts regardless of focus by default, with
-  optional terminal/tab focus suppression. Use when the user wants to test,
-  inspect watcher/focus status, configure sounds/language/focus modes, or
-  troubleshoot Done Notify notifications.
+  when a turn finishes, fails, receives a /swarm worker [done] report, asks a
+  question (ask_question), or waits on a tool/subagent permission prompt. Alerts
+  regardless of focus by default, with optional terminal/tab focus suppression.
+  Use when the user wants to test, inspect watcher/focus status, configure
+  sounds/language/focus modes, or troubleshoot Done Notify notifications.
 ---
 
 # Done Notify for Antigravity CLI
@@ -17,6 +17,7 @@ This skill bundles [done-notify.py](./scripts/done-notify.py), a zero-dependency
 
 1. Send an immediate test notification with sound:
    - Completion alert (`sound`, default `Glass`): `python3 ./scripts/done-notify.py --test`
+   - `/swarm` worker `[done]` alert (`sound`, default `Glass`): `python3 ./scripts/done-notify.py --test --swarm-done`
    - Question prompt alert (`prompt_sound`, default `Ping`): `python3 ./scripts/done-notify.py --test --question`
    - Permission prompt alert (`prompt_sound`, default `Ping`): `python3 ./scripts/done-notify.py --test --permission`
    - Failure alert (`error_sound`, default `Sosumi`): `python3 ./scripts/done-notify.py --test --error`
@@ -29,7 +30,7 @@ This skill bundles [done-notify.py](./scripts/done-notify.py), a zero-dependency
    - `python3 ./scripts/done-notify.py --set sound_mode=both`
    - `python3 ./scripts/done-notify.py --set focus_mode=always --set prompt_focus_mode=always`
    - Optional focus suppression when viewing the CLI: `python3 ./scripts/done-notify.py --set focus_mode=tab`
-   - `python3 ./scripts/done-notify.py --set notify_on_question=true --set notify_on_permission=true`
+   - `python3 ./scripts/done-notify.py --set notify_on_question=true --set notify_on_permission=true --set notify_on_swarm_done=true`
    - `python3 ./scripts/done-notify.py --set show_conversation=true`
    - `python3 ./scripts/done-notify.py --set min_duration_sec=5`
    - `python3 ./scripts/done-notify.py --reset-config`
