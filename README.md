@@ -5,7 +5,8 @@ Zero-dependency productivity plugins for Google Antigravity CLI (`agy`), modeled
 - **[`done-notify`](./done-notify)** — macOS Notification Center banner + system sound when an `agy` turn finishes, fails, asks a question (`ask_question`), or pauses waiting for user permission approval (alerts even while focused by default, with optional terminal/tab focus suppression).
 - **[`token-weather`](./token-weather)** — Live three-line weather-themed `statusLine` band organized into (1) execution mode (`[default]`, `[accept-edits]`, `[auto]`, `[plan]`, `[VIM:*]`), active model, conversation name, and session metadata, (2) 5-hour & weekly model quota usage alongside Google Colab remaining compute units, and (3) context window fill tier, 8-turn sparkline, token delta, and prompt cache TTL countdown.
 - **[`safe-allow`](./safe-allow)** — Smart `PreToolUse` policy guard for `/swarm` subagents and the main `agy` session that validates compound commands segment by segment and returns `allow` with `permissionOverrides` for verified safe operations while keeping destructive commands, credential accesses, and unconfigured hosts gated on `ask`.
-- **[Maximum Context Window (`900K` / `1M` Tier)](#4-maximum-context-window-900k--1m-tier)**, how `agy` `v1.5.10` gates context compaction, why `"contextWindow": "900K"` in `settings.json` alone still compacts around 500K tokens, and how to unlock a `900,000`-token threshold on `Gemini 4 Argon` via `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
+- **[`conv-restore`](./conv-restore)** — Zero-dependency diagnostic and recovery skill for disappeared `agy` conversations covering `default-cli-project.json` workspace pollution (`#1657`), 0-step SQLite `.db` stub shadowing (`#1602`), stale or zeroed summaries, and archived annotations, with dry-run previews, automatic timestamped backups, offline finalization, and integrity verification.
+- **[Maximum Context Window (`900K` / `1M` Tier)](#5-maximum-context-window-900k--1m-tier)**, how `agy` `v1.5.10` gates context compaction, why `"contextWindow": "900K"` in `settings.json` alone still compacts around 500K tokens, and how to unlock a `900,000`-token threshold on `Gemini 4 Argon` via `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
 
 ---
 
@@ -18,6 +19,7 @@ git clone https://github.com/rzyu45/agy-plugins.git
 agy plugin install ./agy-plugins/done-notify
 agy plugin install ./agy-plugins/token-weather
 agy plugin install ./agy-plugins/safe-allow
+agy plugin install ./agy-plugins/conv-restore
 ```
 
 Verify installed plugins:
@@ -179,7 +181,50 @@ See [`safe-allow/skills/safe-allow/references/README.md`](./safe-allow/skills/sa
 
 ---
 
-## 4. Maximum Context Window (`900K` / `1M` Tier)
+## 4. `conv-restore` (Diagnose & Restore Disappeared Conversations)
+
+[`conv-restore`](./conv-restore) provides a zero-dependency Python 3 recovery CLI and skill for diagnosing and restoring disappeared Antigravity CLI (`agy`) conversations across all four known failure modes:
+
+- **Mode A (`default-cli-project.json` workspace pollution, upstream `#1657`)**: Detects stale `projectResources.resources[].folderUri` entries that sort ahead of real project URIs and hide them in `/resume`, strips the polluter URI from `trajectory_metadata_blob` (Protobuf wire-validated before any write) and `conversation_summaries.db` / `conversations_fts`, preserves genuine single-workspace conversations untouched, skips legacy `.pb`-only conversations safely, and removes stale `jetbox_summaries_proto.pb` + `cache/conversation_metadata.json` offline so `reconcile_summaries.go` rebuilds clean summaries natively.
+- **Mode B (0-step `.db` stub shadowing `.pb`, upstream `#1602`)**: Detects verified empty `<cid>.db` stubs (`steps == 0`, `trajectory_meta == (0, 0)`, empty `trajectory_metadata_blob`) beside non-empty `<cid>.pb` files in both CLI and Hub stores, isolates them into `<backup>/stub_dbs/` (never deleting transcripts or `.pb` blobs), and clears stale summary caches for native recovery.
+- **Mode C (stale, missing, or zeroed summaries)**: Flags healthy `.db` or `.pb` conversations missing from `conversation_summaries.db` or stuck at `step_count = 0` / `0001-01-01` and clears stale caches so the next launch rebuilds accurate summaries.
+- **Mode D (archived annotations)**: Lists conversations marked `archived: true` in `annotations/<cid>.pbtxt` and optionally unarchives explicitly selected IDs via `ConversationService/UpdateConversation`.
+
+### Usage, Safety Guards & Disabling
+
+All read-only scans copy SQLite `.db`/`-wal`/`-shm` files into a temporary directory first. Writes create an automatic timestamped backup under `/tmp/agy-conv-restore-backup-<YYYYMMDD_HHMMSS>/`, enforce `PRAGMA integrity_check`, and refuse full offline edits while any `agy` process is running:
+
+```bash
+SCRIPT=~/.gemini/config/plugins/conv-restore/skills/conv-restore/scripts/conv-restore.py
+
+# 1. Read-only diagnosis across all 4 modes
+python3 "$SCRIPT" --diagnose
+
+# 2. Dry-run preview (optionally targeting an explicit polluter path or URI)
+python3 "$SCRIPT" --dry-run --strip-uri /path/to/polluter-project
+
+# 3. Full offline restore (run in a regular terminal after exiting all agy sessions)
+python3 "$SCRIPT" --restore
+
+# 4. Partial live restore of inactive .db files while inside agy, then offline finalize after exit
+python3 "$SCRIPT" --restore --live-inactive-only
+python3 "$SCRIPT" --finalize
+
+# 5. Verify SQLite/FTS5 integrity and zero remaining anomalies (optional /tmp agy --hub staging check)
+python3 "$SCRIPT" --verify
+python3 "$SCRIPT" --verify --verify-staging
+
+# 6. Disable or uninstall once agy fixes the bug upstream
+agy plugin disable conv-restore
+agy plugin enable conv-restore
+agy plugin uninstall conv-restore
+```
+
+See [`conv-restore/skills/conv-restore/references/README.md`](./conv-restore/skills/conv-restore/references/README.md) for Chinese documentation.
+
+---
+
+## 5. Maximum Context Window (`900K` / `1M` Tier)
 
 Although 1M-window models advertise a 1,000,000-token context window, `agy` `v1.5.10` triggers automatic conversation compaction from `CheckpointConfig.MaxTokenLimit`, which the server catalog sets around 500,000 to 512,000 tokens by default. Raising the compaction threshold to `900,000` tokens in public `agy` `v1.5.10` requires both selecting `Gemini 4 Argon` and setting `AGY_CLI_AUTO_COMPACT_OVERRIDE=900000`.
 

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "conv-restore",
+  "displayName": "Conversation Restore",
+  "version": "1.0.0",
+  "description": "Diagnose and restore disappeared Antigravity CLI (agy) conversations caused by default-cli-project.json workspace pollution, 0-step SQLite stub shadowing, stale or zeroed summary rows, or archived annotations, with dry-run previews, automatic timestamped backups, offline finalization, and integrity verification.",
+  "author": {
+    "name": "Ruizhi Yu",
+    "url": "https://github.com/rzyu45"
+  },
+  "repository": "https://github.com/rzyu45/agy-plugins",
+  "category": "Productivity",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Diagnose missing or hidden agy conversations for this project",
+    "Dry-run restoration for disappeared agy-cli conversations",
+    "Verify conversation store integrity and show how to disable conv-restore"
+  ]
+}
